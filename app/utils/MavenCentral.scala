@@ -54,7 +54,7 @@ object MavenCentral {
 
   def fetchFileList(groupId: String, artifactId: String, version: String): Try[List[String]] = {
     getFile(groupId, artifactId, version).map { case (jarInputStream, inputStream) =>
-      val webJarFiles = Stream.continually(jarInputStream.getNextJarEntry).
+      val webJarFiles = Iterator.continually(jarInputStream.getNextJarEntry).
         takeWhile(_ != null).
         filterNot(_.isDirectory).
         map(_.getName).

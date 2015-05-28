@@ -9,7 +9,8 @@ scalaVersion := "2.11.6"
 libraryDependencies ++= Seq(
   ws,
   filters,
-  "org.webjars" %% "webjars-play" % "2.3.0-3"
+  "org.webjars" %% "webjars-play" % "2.3.0-3",
+  "org.apache.commons" % "commons-io" % "1.3.2"
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")

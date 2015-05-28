@@ -2,6 +2,7 @@ package controllers
 
 import java.io.{FileNotFoundException, BufferedInputStream}
 
+import org.apache.commons.io.IOUtils
 import org.joda.time.DateTimeZone
 import org.joda.time.format.{DateTimeFormat, DateTimeFormatter}
 import play.api.libs.json.Json
@@ -25,7 +26,7 @@ object Application extends Controller {
 
       Future.fromTry {
         MavenCentral.getFile(groupId, artifactId, webJarVersion).map { case (jarInputStream, inputStream) =>
-          Stream.continually(jarInputStream.getNextJarEntry).takeWhile(_ != null).find { jarEntry =>
+          Iterator.continually(jarInputStream.getNextJarEntry).takeWhile(_ != null).find { jarEntry =>
             // this allows for sloppyness where the webJarVersion and path differ
             // todo: eventually be more strict but since this has been allowed many WebJars do not have version and path consistency
             jarEntry.getName.startsWith(pathPrefix) && jarEntry.getName.endsWith(s"/$file")
@@ -35,7 +36,7 @@ object Application extends Controller {
             NotFound(s"Found WebJar ($groupId : $artifactId : $webJarVersion) but could not find: $pathPrefix$webJarVersion/$file")
           } { jarEntry =>
             val bis = new BufferedInputStream(jarInputStream)
-            val bArray = Stream.continually(bis.read).takeWhile(_ != -1).map(_.toByte).toArray
+            val bArray = IOUtils.toByteArray(bis)
             bis.close()
             jarInputStream.close()
             inputStream.close()
