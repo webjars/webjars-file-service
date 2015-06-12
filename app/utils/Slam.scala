@@ -1,6 +1,6 @@
 package utils
 
-import play.api.libs.json.JsValue
+import play.api.libs.json.{Json, JsValue}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
@@ -24,7 +24,9 @@ object Slam extends App {
       }
 
       val listFilesFutures = webJars.take(numRequests).map { case (groupId, artifactId, version) =>
-        ws.url(s"http://$hostname/listfiles/$groupId/$artifactId/$version").get().map(_.json)
+        ws.url(s"http://$hostname/listfiles/$groupId/$artifactId/$version").get().map(_.json).recover {
+          case _ => Json.arr()
+        }
       }
 
       val results = Future.sequence(listFilesFutures)
