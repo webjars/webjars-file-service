@@ -70,15 +70,15 @@ object Application extends Controller {
   }
 
   def listFiles(groupId: String, artifactId: String, version: String) = CorsAction {
-    Action {
-      MavenCentral.fetchFileList(groupId, artifactId, version) match {
-        case Success(fileList) =>
-          Ok(Json.toJson(fileList))
-        case Failure(e: FileNotFoundException) =>
+    Action.async {
+      MavenCentral.fetchFileList(groupId, artifactId, version).map { fileList =>
+        Ok(Json.toJson(fileList))
+      } recover {
+        case e: FileNotFoundException =>
           NotFound(s"WebJar Not Found $groupId : $artifactId : $version")
-        case Failure(ure: UnexpectedResponseException) =>
+        case ure: UnexpectedResponseException =>
           Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
-        case Failure(e) =>
+        case e: Exception =>
           InternalServerError(e.getMessage)
       }
     }

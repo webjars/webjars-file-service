@@ -4,12 +4,16 @@ import java.io.{File, InputStream}
 import java.net.{URLEncoder, URL}
 import java.nio.file.Files
 import java.util.jar.JarInputStream
+import shade.memcached.MemcachedCodecs._
 
 import org.webjars.WebJarAssetLocator
 import play.api.Play
 import play.api.libs.ws.WSResponse
 
+import scala.concurrent.Future
+import scala.concurrent.duration.Duration
 import scala.util.{Success, Try}
+import scala.concurrent.ExecutionContext.Implicits.global
 
 object MavenCentral {
 
@@ -51,18 +55,26 @@ object MavenCentral {
     }
   }
 
+  def fetchFileList(groupId: String, artifactId: String, version: String): Future[List[String]] = {
+    val cacheKey = s"listfiles-$groupId-$artifactId-$version"
 
-  def fetchFileList(groupId: String, artifactId: String, version: String): Try[List[String]] = {
-    getFile(groupId, artifactId, version).map { case (jarInputStream, inputStream) =>
-      val webJarFiles = Iterator.continually(jarInputStream.getNextJarEntry).
-        takeWhile(_ != null).
-        filterNot(_.isDirectory).
-        map(_.getName).
-        filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
-        toList
-      jarInputStream.close()
-      inputStream.close()
-      webJarFiles
+    Global.memcached.get[List[String]](cacheKey).flatMap { maybeFileList =>
+      maybeFileList.fold(Future.failed[List[String]](new Exception("cache miss")))(Future.successful)
+    } recoverWith { case e: Exception =>
+      Future.fromTry {
+        getFile(groupId, artifactId, version).map { case (jarInputStream, inputStream) =>
+          val webJarFiles = Iterator.continually(jarInputStream.getNextJarEntry).
+            takeWhile(_ != null).
+            filterNot(_.isDirectory).
+            map(_.getName).
+            filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
+            toList
+          jarInputStream.close()
+          inputStream.close()
+          Global.memcached.set(cacheKey, webJarFiles, Duration.Inf)
+          webJarFiles
+        }
+      }
     }
   }
 

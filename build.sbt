@@ -4,13 +4,16 @@ version := "1.0-SNAPSHOT"
 
 lazy val root = (project in file(".")).enablePlugins(PlayScala)
 
-scalaVersion := "2.11.6"
+scalaVersion := "2.11.7"
+
+resolvers += "Spy Repository" at "http://files.couchbase.com/maven2"
 
 libraryDependencies ++= Seq(
   ws,
   filters,
   "org.webjars" %% "webjars-play" % "2.3.0-3",
-  "org.apache.commons" % "commons-io" % "1.3.2"
+  "org.apache.commons" % "commons-io" % "1.3.2",
+  "com.bionicspirit" %% "shade" % "1.6.0"
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
