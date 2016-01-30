@@ -13,7 +13,7 @@ libraryDependencies ++= Seq(
   filters,
   "org.webjars" %% "webjars-play" % "2.3.0-3",
   "org.apache.commons" % "commons-io" % "1.3.2",
-  "com.bionicspirit" %% "shade" % "1.6.0"
+  "com.bionicspirit" %% "shade" % "1.7.2"
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
