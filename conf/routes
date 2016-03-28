@@ -11,4 +11,7 @@ OPTIONS        /files/*file                                               contro
 GET            /listfiles/:artifactId/:version                            controllers.Application.listFiles(groupId = "org.webjars", artifactId, version)
 GET            /listfiles/:groupId/:artifactId/:version                   controllers.Application.listFiles(groupId, artifactId, version)
 
+GET            /robots.txt                                                controllers.Assets.at(path="/public", file="robots.txt")
+GET            /files/robots.txt                                          controllers.Assets.at(path="/public", file="robots.txt")
+
 OPTIONS        /*path                                                     controllers.Application.corsPreflight(path: String)
