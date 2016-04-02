@@ -1,31 +1,29 @@
 package controllers
 
-import java.io.{FileNotFoundException, BufferedInputStream}
+import java.io.{BufferedInputStream, FileNotFoundException}
+import javax.inject.Inject
 
 import org.apache.commons.io.IOUtils
 import org.joda.time.DateTimeZone
 import org.joda.time.format.{DateTimeFormat, DateTimeFormatter}
 import play.api.libs.json.Json
-import utils.MavenCentral
+import utils.{MavenCentral, Memcache, UnexpectedResponseException}
+
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import play.api._
 import play.api.libs.MimeTypes
 import play.api.mvc._
-import play.api.Play.current
 
-import utils.MavenCentral.UnexpectedResponseException
 
-import scala.util.{Failure, Success}
-
-object Application extends Controller {
+class Application @Inject() (config: Configuration, memcache: Memcache, mavenCentral: MavenCentral) extends Controller {
 
   def file(groupId: String, artifactId: String, webJarVersion: String, file: String) = CorsAction {
     Action.async { request =>
       val pathPrefix = s"META-INF/resources/webjars/$artifactId/"
 
       Future.fromTry {
-        MavenCentral.getFile(groupId, artifactId, webJarVersion).map { case (jarInputStream, inputStream) =>
+        mavenCentral.getFile(groupId, artifactId, webJarVersion).map { case (jarInputStream, inputStream) =>
           Iterator.continually(jarInputStream.getNextJarEntry).takeWhile(_ != null).find { jarEntry =>
             // this allows for sloppyness where the webJarVersion and path differ
             // todo: eventually be more strict but since this has been allowed many WebJars do not have version and path consistency
@@ -71,7 +69,7 @@ object Application extends Controller {
 
   def listFiles(groupId: String, artifactId: String, version: String) = CorsAction {
     Action.async {
-      MavenCentral.fetchFileList(groupId, artifactId, version).map { fileList =>
+      mavenCentral.fetchFileList(groupId, artifactId, version).map { fileList =>
         Ok(Json.toJson(fileList))
       } recover {
         case e: FileNotFoundException =>
@@ -113,7 +111,7 @@ object Application extends Controller {
   private val dfp: DateTimeFormatter =
     DateTimeFormat.forPattern("EEE, dd MMM yyyy HH:mm:ss").withLocale(java.util.Locale.ENGLISH).withZone(DateTimeZone.forID(timeZoneCode))
 
-  private lazy val defaultCharSet = Play.configuration.getString("default.charset").getOrElse("utf-8")
+  private lazy val defaultCharSet = config.getString("default.charset").getOrElse("utf-8")
 
   private def addCharsetIfNeeded(mimeType: String): String =
     if (MimeTypes.isText(mimeType))

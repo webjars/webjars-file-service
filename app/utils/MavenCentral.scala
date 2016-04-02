@@ -1,13 +1,14 @@
 package utils
 
 import java.io.{File, InputStream}
-import java.net.{URLEncoder, URL}
+import java.net.{URL, URLEncoder}
 import java.nio.file.Files
 import java.util.jar.JarInputStream
-import shade.memcached.MemcachedCodecs._
+import javax.inject.Inject
 
+import shade.memcached.MemcachedCodecs._
 import org.webjars.WebJarAssetLocator
-import play.api.Play
+import play.api.Configuration
 import play.api.libs.ws.WSResponse
 
 import scala.concurrent.Future
@@ -15,12 +16,12 @@ import scala.concurrent.duration.Duration
 import scala.util.{Success, Try}
 import scala.concurrent.ExecutionContext.Implicits.global
 
-object MavenCentral {
+class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
 
   lazy val tempDir: File = Files.createTempDirectory("webjars").toFile
 
-  val primaryBaseJarUrl = Play.current.configuration.getString("webjars.jarUrl.primary").get
-  val fallbackBaseJarUrl = Play.current.configuration.getString("webjars.jarUrl.fallback").get
+  val primaryBaseJarUrl = config.getString("webjars.jarUrl.primary").get
+  val fallbackBaseJarUrl = config.getString("webjars.jarUrl.fallback").get
 
   def getFile(groupId: String, artifactId: String, version: String): Try[(JarInputStream, InputStream)] = {
     val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
@@ -58,7 +59,7 @@ object MavenCentral {
   def fetchFileList(groupId: String, artifactId: String, version: String): Future[List[String]] = {
     val cacheKey = s"listfiles-$groupId-$artifactId-$version"
 
-    Global.memcached.get[List[String]](cacheKey).flatMap { maybeFileList =>
+    memcache.connection.get[List[String]](cacheKey).flatMap { maybeFileList =>
       maybeFileList.fold(Future.failed[List[String]](new Exception("cache miss")))(Future.successful)
     } recoverWith { case e: Exception =>
       Future.fromTry {
@@ -71,16 +72,15 @@ object MavenCentral {
             toList
           jarInputStream.close()
           inputStream.close()
-          Global.memcached.set(cacheKey, webJarFiles, Duration.Inf)
+          memcache.connection.set(cacheKey, webJarFiles, Duration.Inf)
           webJarFiles
         }
       }
     }
   }
 
-  case class UnexpectedResponseException(response: WSResponse) extends RuntimeException {
-    override def getMessage: String = response.statusText
-  }
-
 }
 
+case class UnexpectedResponseException(response: WSResponse) extends RuntimeException {
+  override def getMessage: String = response.statusText
+}
