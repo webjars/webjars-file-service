@@ -84,8 +84,8 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
 
   def numFiles(groupId: String, artifactId: String, version: String) = CorsAction {
     Action.async {
-      mavenCentral.fetchFileList(groupId, artifactId, version).map { fileList =>
-        Ok(fileList.size.toString)
+      mavenCentral.numFiles(groupId, artifactId, version).map { numFiles =>
+        Ok(numFiles.toString)
       } recover {
         case e: FileNotFoundException =>
           NotFound(s"WebJar Not Found $groupId : $artifactId : $version")

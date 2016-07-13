@@ -81,6 +81,20 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
     }
   }
 
+  def numFiles(groupId: String, artifactId: String, version: String): Future[Int] = {
+    val cacheKey = s"numfiles-$groupId-$artifactId-$version"
+
+    memcache.connection.get[Int](cacheKey).flatMap { maybeNumFiles =>
+      maybeNumFiles.fold(Future.failed[Int](new Exception("cache miss")))(Future.successful)
+    } recoverWith { case e: Exception =>
+      fetchFileList(groupId, artifactId, version).map { fileList =>
+        val numFiles = fileList.size
+        memcache.connection.set(cacheKey, numFiles, Duration.Inf)
+        numFiles
+      }
+    }
+  }
+
 }
 
 case class UnexpectedResponseException(response: WSResponse) extends RuntimeException {
