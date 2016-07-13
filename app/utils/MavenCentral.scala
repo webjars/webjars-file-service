@@ -6,7 +6,6 @@ import java.nio.file.Files
 import java.util.jar.JarInputStream
 import javax.inject.Inject
 
-import shade.memcached.MemcachedCodecs._
 import org.webjars.WebJarAssetLocator
 import play.api.{Configuration, Logger}
 import play.api.libs.ws.WSResponse
@@ -15,6 +14,7 @@ import scala.concurrent.Future
 import scala.concurrent.duration.Duration
 import scala.util.{Success, Try}
 import scala.concurrent.ExecutionContext.Implicits.global
+import utils.Memcache._
 
 class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
 
