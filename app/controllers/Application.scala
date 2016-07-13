@@ -82,6 +82,21 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
     }
   }
 
+  def numFiles(groupId: String, artifactId: String, version: String) = CorsAction {
+    Action.async {
+      mavenCentral.fetchFileList(groupId, artifactId, version).map { fileList =>
+        Ok(fileList.size.toString)
+      } recover {
+        case e: FileNotFoundException =>
+          NotFound(s"WebJar Not Found $groupId : $artifactId : $version")
+        case ure: UnexpectedResponseException =>
+          Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
+        case e: Exception =>
+          InternalServerError(e.getMessage)
+      }
+    }
+  }
+
   case class CorsAction[A](action: Action[A]) extends Action[A] {
 
     def apply(request: Request[A]): Future[Result] = {

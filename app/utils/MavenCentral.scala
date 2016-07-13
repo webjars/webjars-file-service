@@ -8,7 +8,7 @@ import javax.inject.Inject
 
 import shade.memcached.MemcachedCodecs._
 import org.webjars.WebJarAssetLocator
-import play.api.Configuration
+import play.api.{Configuration, Logger}
 import play.api.libs.ws.WSResponse
 
 import scala.concurrent.Future
@@ -72,7 +72,9 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
             toList
           jarInputStream.close()
           inputStream.close()
-          memcache.connection.set(cacheKey, webJarFiles, Duration.Inf)
+          memcache.connection.set(cacheKey, webJarFiles, Duration.Inf).onFailure {
+            case e: Exception => Logger.error(s"Could not store file list in cache for $cacheKey", e)
+          }
           webJarFiles
         }
       }

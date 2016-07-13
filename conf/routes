@@ -9,7 +9,9 @@ GET            /files/:artifactId/:version/*file                          contro
 OPTIONS        /files/*file                                               controllers.Application.fileOptions(file)
 
 GET            /listfiles/:artifactId/:version                            controllers.Application.listFiles(groupId = "org.webjars", artifactId, version)
+GET            /numfiles/:artifactId/:version                             controllers.Application.numFiles(groupId = "org.webjars", artifactId, version)
 GET            /listfiles/:groupId/:artifactId/:version                   controllers.Application.listFiles(groupId, artifactId, version)
+GET            /numfiles/:groupId/:artifactId/:version                    controllers.Application.numFiles(groupId, artifactId, version)
 
 GET            /robots.txt                                                controllers.Assets.at(path="/public", file="robots.txt")
 GET            /files/robots.txt                                          controllers.Assets.at(path="/public", file="robots.txt")

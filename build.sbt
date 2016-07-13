@@ -1,4 +1,4 @@
-name := """webjars-file-service"""
+name := "webjars-file-service"
 
 version := "1.0-SNAPSHOT"
 
@@ -9,9 +9,9 @@ scalaVersion := "2.11.8"
 libraryDependencies ++= Seq(
   ws,
   filters,
-  "org.webjars" %% "webjars-play" % "2.5.0",
+  "org.webjars" %% "webjars-play" % "2.5.0-2",
   "org.apache.commons" % "commons-io" % "1.3.2",
-  "com.bionicspirit" %% "shade" % "1.7.2"
+  "com.bionicspirit" %% "shade" % "1.7.4"
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
