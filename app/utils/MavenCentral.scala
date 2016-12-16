@@ -26,27 +26,35 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
   def getFile(groupId: String, artifactId: String, version: String): Try[(JarInputStream, InputStream)] = {
     val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
 
-    if (tmpFile.exists()) {
-      val fileInputStream = Files.newInputStream(tmpFile.toPath)
-      Success((new JarInputStream(fileInputStream), fileInputStream))
+    val tryInputStreams = if (tmpFile.exists()) {
+      val tryFileInputStream = Try(Files.newInputStream(tmpFile.toPath))
+      tryFileInputStream.map(inputStream => (new JarInputStream(inputStream), inputStream))
     }
     else {
-      val fileInputStreamFuture = getFileInputStream(primaryBaseJarUrl, groupId, artifactId, version).recoverWith {
+      val tryFileInputStream = getFileInputStream(primaryBaseJarUrl, groupId, artifactId, version).recoverWith {
         case _ =>
           getFileInputStream(fallbackBaseJarUrl, groupId, artifactId, version)
       }
 
-      fileInputStreamFuture.map { fileInputStream =>
+      tryFileInputStream.flatMap { fileInputStream =>
         // todo: not thread safe!
         // write to the fs
-        Files.copy(fileInputStream, tmpFile.toPath)
-        fileInputStream.close()
+        val tryCopy = Try(Files.copy(fileInputStream, tmpFile.toPath))
+        tryCopy.flatMap { _ =>
+          fileInputStream.close()
 
-        val tmpFileInputStream = Files.newInputStream(tmpFile.toPath)
-        // read it from the fs since we've drained the http response
-        (new JarInputStream(tmpFileInputStream), tmpFileInputStream)
+          val tryTmpFileInputStream = Try(Files.newInputStream(tmpFile.toPath))
+
+          tryTmpFileInputStream.map(tmpFileInputStream => (new JarInputStream(tmpFileInputStream), tmpFileInputStream))
+        }
       }
     }
+
+    if (tryInputStreams.isFailure) {
+      tmpFile.delete()
+    }
+
+    tryInputStreams
   }
 
   def getFileInputStream(baseJarUrl: String, groupId: String, artifactId: String, version: String): Try[InputStream] = {

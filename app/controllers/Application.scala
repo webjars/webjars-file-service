@@ -92,6 +92,7 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
         case ure: UnexpectedResponseException =>
           Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
         case e: Exception =>
+          Logger.error(s"Error getting numFiles for $groupId $artifactId $version", e)
           InternalServerError(e.getMessage)
       }
     }
