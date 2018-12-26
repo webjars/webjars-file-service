@@ -37,14 +37,14 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
       }
 
       tryFileInputStream.flatMap { fileInputStream =>
-        val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar.tmp")
+        val tmpFile = Files.createTempFile("webjars", ".jar")
 
         // write to the fs
-        val tryCopy = Try(Files.copy(fileInputStream, tmpFile.toPath))
+        val tryCopy = Try(Files.copy(fileInputStream, tmpFile))
         tryCopy.flatMap { _ =>
           fileInputStream.close()
 
-          Files.move(tmpFile.toPath, jarFile.toPath)
+          Files.move(tmpFile, jarFile.toPath)
 
           val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
 
