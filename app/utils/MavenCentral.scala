@@ -24,10 +24,10 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
   val fallbackBaseJarUrl = config.getString("webjars.jarUrl.fallback").get
 
   def getFile(groupId: String, artifactId: String, version: String): Try[(JarInputStream, InputStream)] = {
-    val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
+    val jarFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
 
-    val tryInputStreams = if (tmpFile.exists()) {
-      val tryFileInputStream = Try(Files.newInputStream(tmpFile.toPath))
+    val tryInputStreams = if (jarFile.exists()) {
+      val tryFileInputStream = Try(Files.newInputStream(jarFile.toPath))
       tryFileInputStream.map(inputStream => (new JarInputStream(inputStream), inputStream))
     }
     else {
@@ -37,13 +37,16 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
       }
 
       tryFileInputStream.flatMap { fileInputStream =>
-        // todo: not thread safe!
+        val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar.tmp")
+
         // write to the fs
         val tryCopy = Try(Files.copy(fileInputStream, tmpFile.toPath))
         tryCopy.flatMap { _ =>
           fileInputStream.close()
 
-          val tryTmpFileInputStream = Try(Files.newInputStream(tmpFile.toPath))
+          Files.move(tmpFile.toPath, jarFile.toPath)
+
+          val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
 
           tryTmpFileInputStream.map(tmpFileInputStream => (new JarInputStream(tmpFileInputStream), tmpFileInputStream))
         }
@@ -51,7 +54,7 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
     }
 
     if (tryInputStreams.isFailure) {
-      tmpFile.delete()
+      jarFile.delete()
     }
 
     tryInputStreams

@@ -51,7 +51,7 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
           }
         }
       } recover {
-        case nf: FileNotFoundException =>
+        case _: FileNotFoundException =>
           NotFound(s"WebJar Not Found $groupId : $artifactId : $webJarVersion")
         case ure: UnexpectedResponseException =>
           Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $webJarVersion) - ${ure.response.statusText}")
