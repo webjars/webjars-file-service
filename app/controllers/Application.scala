@@ -51,8 +51,8 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
           }
         }
       } recover {
-        case _: FileNotFoundException =>
-          NotFound(s"WebJar Not Found $groupId : $artifactId : $webJarVersion")
+        case e: FileNotFoundException =>
+          NotFound(s"WebJar Not Found $groupId : $artifactId : $webJarVersion - ${e.getMessage}")
         case ure: UnexpectedResponseException =>
           Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $webJarVersion) - ${ure.response.statusText}")
         case e: Exception =>
@@ -73,7 +73,7 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
         Ok(Json.toJson(fileList))
       } recover {
         case e: FileNotFoundException =>
-          NotFound(s"WebJar Not Found $groupId : $artifactId : $version")
+          NotFound(s"WebJar Not Found $groupId : $artifactId : $version - ${e.getMessage}")
         case ure: UnexpectedResponseException =>
           Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
         case e: Exception =>
@@ -88,7 +88,7 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
         Ok(numFiles.toString)
       } recover {
         case e: FileNotFoundException =>
-          NotFound(s"WebJar Not Found $groupId : $artifactId : $version")
+          NotFound(s"WebJar Not Found $groupId : $artifactId : $version - ${e.getMessage}")
         case ure: UnexpectedResponseException =>
           Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
         case e: Exception =>
