@@ -4,15 +4,15 @@ import java.io.{File, InputStream}
 import java.net.{URL, URLEncoder}
 import java.nio.file.Files
 import java.util.jar.JarInputStream
-import javax.inject.Inject
 
+import javax.inject.Inject
 import org.webjars.WebJarAssetLocator
 import play.api.{Configuration, Logger}
 import play.api.libs.ws.WSResponse
 
 import scala.concurrent.Future
 import scala.concurrent.duration.Duration
-import scala.util.{Success, Try}
+import scala.util.{Random, Success, Try}
 import scala.concurrent.ExecutionContext.Implicits.global
 import utils.Memcache._
 
@@ -37,14 +37,15 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
       }
 
       tryFileInputStream.flatMap { fileInputStream =>
-        val tmpFile = Files.createTempFile("webjars", ".jar")
+        val randomString = Random.alphanumeric.take(8).mkString
+        val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar-tmp-$randomString")
 
         // write to the fs
-        val tryCopy = Try(Files.copy(fileInputStream, tmpFile))
+        val tryCopy = Try(Files.copy(fileInputStream, tmpFile.toPath))
         tryCopy.flatMap { _ =>
           fileInputStream.close()
 
-          Files.move(tmpFile, jarFile.toPath)
+          Files.move(tmpFile.toPath, jarFile.toPath)
 
           val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
 
