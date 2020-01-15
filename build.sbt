@@ -1,17 +1,17 @@
+enablePlugins(PlayScala)
+
 name := "webjars-file-service"
 
-version := "1.0-SNAPSHOT"
-
-lazy val root = (project in file(".")).enablePlugins(PlayScala)
-
-scalaVersion := "2.11.8"
+scalaVersion := "2.13.1"
 
 libraryDependencies ++= Seq(
   ws,
+  guice,
   filters,
-  "org.webjars" %% "webjars-play" % "2.5.0-2",
+  cacheApi,
+  "org.webjars" %% "webjars-play" % "2.8.0",
   "org.apache.commons" % "commons-io" % "1.3.2",
-  "com.bionicspirit" %% "shade" % "1.7.4"
+  "com.github.mumoshu" %% "play2-memcached-play27" % "0.10.1"
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")

@@ -7,58 +7,48 @@ import java.util.jar.JarInputStream
 
 import javax.inject.Inject
 import org.webjars.WebJarAssetLocator
-import play.api.{Configuration, Logger}
-import play.api.libs.ws.WSResponse
+import play.api.Configuration
+import play.api.cache.AsyncCacheApi
 
-import scala.concurrent.Future
-import scala.concurrent.duration.Duration
-import scala.util.{Random, Success, Try}
 import scala.concurrent.ExecutionContext.Implicits.global
-import utils.Memcache._
+import scala.concurrent.Future
+import scala.util.{Random, Success, Try}
 
-class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
+class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
 
   lazy val tempDir: File = Files.createTempDirectory("webjars").toFile
 
-  val primaryBaseJarUrl = config.getString("webjars.jarUrl.primary").get
-  val fallbackBaseJarUrl = config.getString("webjars.jarUrl.fallback").get
+  val baseJarUrl = config.get[String]("webjars.jarUrl")
 
-  def getFile(groupId: String, artifactId: String, version: String): Try[(JarInputStream, InputStream)] = {
+  def getFile(groupId: String, artifactId: String, version: String): Try[File] = {
     val jarFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
 
-    val tryInputStreams = if (jarFile.exists()) {
-      val tryFileInputStream = Try(Files.newInputStream(jarFile.toPath))
-      tryFileInputStream.map(inputStream => (new JarInputStream(inputStream), inputStream))
+    if (jarFile.exists()) {
+      Success(jarFile)
     }
     else {
-      val tryFileInputStream = getFileInputStream(primaryBaseJarUrl, groupId, artifactId, version).recoverWith {
-        case _ =>
-          getFileInputStream(fallbackBaseJarUrl, groupId, artifactId, version)
-      }
+      val tryFileInputStream = getFileInputStream(baseJarUrl, groupId, artifactId, version)
 
-      tryFileInputStream.flatMap { fileInputStream =>
+      val trySave = tryFileInputStream.flatMap { fileInputStream =>
         val randomString = Random.alphanumeric.take(8).mkString
         val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar-tmp-$randomString")
 
         // write to the fs
         val tryCopy = Try(Files.copy(fileInputStream, tmpFile.toPath))
-        tryCopy.flatMap { _ =>
+        val tryMove = tryCopy.flatMap { _ =>
           fileInputStream.close()
-
-          Files.move(tmpFile.toPath, jarFile.toPath)
-
-          val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
-
-          tryTmpFileInputStream.map(tmpFileInputStream => (new JarInputStream(tmpFileInputStream), tmpFileInputStream))
+          Try(Files.move(tmpFile.toPath, jarFile.toPath)).map(_.toFile)
         }
+
+        tryMove
       }
-    }
 
-    if (tryInputStreams.isFailure) {
-      jarFile.delete()
-    }
+      if (trySave.isFailure) {
+        jarFile.delete()
+      }
 
-    tryInputStreams
+      trySave
+    }
   }
 
   def getFileInputStream(baseJarUrl: String, groupId: String, artifactId: String, version: String): Try[InputStream] = {
@@ -71,23 +61,27 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
   def fetchFileList(groupId: String, artifactId: String, version: String): Future[List[String]] = {
     val cacheKey = s"listfiles-$groupId-$artifactId-$version"
 
-    memcache.connection.get[List[String]](cacheKey).flatMap { maybeFileList =>
-      maybeFileList.fold(Future.failed[List[String]](new Exception("cache miss")))(Future.successful)
-    } recoverWith { case e: Exception =>
+    cache.getOrElseUpdate(cacheKey) {
       Future.fromTry {
-        getFile(groupId, artifactId, version).map { case (jarInputStream, inputStream) =>
-          val webJarFiles = Iterator.continually(jarInputStream.getNextJarEntry).
-            takeWhile(_ != null).
-            filterNot(_.isDirectory).
-            map(_.getName).
-            filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
-            toList
-          jarInputStream.close()
-          inputStream.close()
-          memcache.connection.set(cacheKey, webJarFiles, Duration.Inf).onFailure {
-            case e: Exception => Logger.error(s"Could not store file list in cache for $cacheKey", e)
+        getFile(groupId, artifactId, version).flatMap { jarFile =>
+
+          val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
+
+          tryTmpFileInputStream.map { tmpFileInputStream =>
+            val jarInputStream = new JarInputStream(tmpFileInputStream)
+
+            val webJarFiles = Iterator.continually(jarInputStream.getNextJarEntry).
+              takeWhile(_ != null).
+              filterNot(_.isDirectory).
+              map(_.getName).
+              filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
+              toList
+
+            jarInputStream.close()
+            tmpFileInputStream.close()
+
+            webJarFiles
           }
-          webJarFiles
         }
       }
     }
@@ -96,19 +90,9 @@ class MavenCentral @Inject() (config: Configuration, memcache: Memcache) {
   def numFiles(groupId: String, artifactId: String, version: String): Future[Int] = {
     val cacheKey = s"numfiles-$groupId-$artifactId-$version"
 
-    memcache.connection.get[Int](cacheKey).flatMap { maybeNumFiles =>
-      maybeNumFiles.fold(Future.failed[Int](new Exception("cache miss")))(Future.successful)
-    } recoverWith { case e: Exception =>
-      fetchFileList(groupId, artifactId, version).map { fileList =>
-        val numFiles = fileList.size
-        memcache.connection.set(cacheKey, numFiles, Duration.Inf)
-        numFiles
-      }
+    cache.getOrElseUpdate(cacheKey) {
+      fetchFileList(groupId, artifactId, version).map(_.size)
     }
   }
 
-}
-
-case class UnexpectedResponseException(response: WSResponse) extends RuntimeException {
-  override def getMessage: String = response.statusText
 }

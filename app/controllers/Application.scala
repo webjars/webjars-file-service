@@ -1,60 +1,77 @@
 package controllers
 
-import java.io.{BufferedInputStream, FileNotFoundException}
-import javax.inject.Inject
+import java.io.{File, FileNotFoundException}
+import java.net.URL
 
-import org.apache.commons.io.IOUtils
-import org.joda.time.DateTimeZone
-import org.joda.time.format.{DateTimeFormat, DateTimeFormatter}
+import javax.inject.{Inject, Singleton}
+import play.api._
+import play.api.cache.AsyncCacheApi
+import play.api.http.{AcceptEncoding, FileMimeTypes, HttpErrorHandler}
 import play.api.libs.json.Json
-import utils.{MavenCentral, Memcache, UnexpectedResponseException}
+import play.api.mvc._
+import utils.MavenCentral
 
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.Future
-import play.api._
-import play.api.libs.MimeTypes
-import play.api.mvc._
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
 
-class Application @Inject() (config: Configuration, memcache: Memcache, mavenCentral: MavenCentral) extends Controller {
+@Singleton
+class Application @Inject() (config: Configuration, cache: AsyncCacheApi, mavenCentral: MavenCentral, fileMimeTypes: FileMimeTypes, assetsConfiguration: AssetsConfiguration, httpErrorHandler: HttpErrorHandler) extends InjectedController with Logging {
+
+  val webJarAssetsMetadata = new AssetsMetadata {
+    private lazy val assetInfoCache = new SelfPopulatingMap[String, AssetInfo]()
+
+    override def finder: AssetsFinder = {
+      new AssetsFinder {
+        override def assetsBasePath: String = ""
+        override def assetsUrlPrefix: String = ""
+        override def findAssetPath(basePath: String, rawPath: String): String = ""
+      }
+    }
+
+    override private[controllers] def digest(path: String): Option[String] = None
+
+    private def assetInfoFromResource(name: String): Option[AssetInfo] = {
+      val file = new File(name)
+      Try(new URL("jar:file:" + file.getAbsolutePath)).map { url =>
+        val maybeDigest = digest(name)
+        new AssetInfo(name, url, Seq.empty, maybeDigest, assetsConfiguration, fileMimeTypes)
+      }.toOption
+    }
+
+    private def assetInfo(name: String): Future[Option[AssetInfo]] = {
+      assetInfoCache.putIfAbsent(name)(assetInfoFromResource)
+    }
+
+    override private[controllers] def assetInfoForRequest(request: RequestHeader, name: String): Future[Option[(AssetInfo, AcceptEncoding)]] = {
+      assetInfo(name).map(_.map(_ -> AcceptEncoding.forRequest(request)))
+    }
+  }
+
+  val webJarAssetsBuilder = new AssetsBuilder(httpErrorHandler, webJarAssetsMetadata)
 
   def file(groupId: String, artifactId: String, webJarVersion: String, file: String) = CorsAction {
     Action.async { request =>
       val pathPrefix = s"META-INF/resources/webjars/$artifactId/"
 
       Future.fromTry {
-        mavenCentral.getFile(groupId, artifactId, webJarVersion).map { case (jarInputStream, inputStream) =>
-          Iterator.continually(jarInputStream.getNextJarEntry).takeWhile(_ != null).find { jarEntry =>
-            // this allows for sloppyness where the webJarVersion and path differ
-            // todo: eventually be more strict but since this has been allowed many WebJars do not have version and path consistency
-            jarEntry.getName.startsWith(pathPrefix) && jarEntry.getName.endsWith(s"/$file")
-          }.fold {
-            jarInputStream.close()
-            inputStream.close()
-            NotFound(s"Found WebJar ($groupId : $artifactId : $webJarVersion) but could not find: $pathPrefix$webJarVersion/$file")
-          } { jarEntry =>
-            val bis = new BufferedInputStream(jarInputStream)
-            val bArray = IOUtils.toByteArray(bis)
-            bis.close()
-            jarInputStream.close()
-            inputStream.close()
+        mavenCentral.getFile(groupId, artifactId, webJarVersion)
+      } flatMap { jarFile =>
+        mavenCentral.fetchFileList(groupId, artifactId, webJarVersion).flatMap { webJarFiles =>
+          val maybeFile = webJarFiles.find { webJarFile =>
+            // allows for paths where the path may not include the WebJar version
+            webJarFile.startsWith(pathPrefix) && webJarFile.endsWith(s"/$file")
+          }
 
-            //// From Play's Assets controller
-            val contentType = MimeTypes.forFileName(file).map(m => m + addCharsetIfNeeded(m)).getOrElse(BINARY)
-            ////
-
-            Ok(bArray).as(contentType).withHeaders(
-              CACHE_CONTROL -> "max-age=290304000, public",
-              DATE -> df.print((new java.util.Date).getTime),
-              LAST_MODIFIED -> df.print(jarEntry.getLastModifiedTime.toMillis)
-            )
+          maybeFile.fold(Future.failed[Result](new FileNotFoundException(s"$file not found in WebJar"))) { webJarFile =>
+            val name = jarFile.getAbsolutePath + "!/" + webJarFile
+            webJarAssetsBuilder.at(name)(request)
           }
         }
       } recover {
         case e: FileNotFoundException =>
           NotFound(s"WebJar Not Found $groupId : $artifactId : $webJarVersion - ${e.getMessage}")
-        case ure: UnexpectedResponseException =>
-          Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $webJarVersion) - ${ure.response.statusText}")
         case e: Exception =>
           InternalServerError(s"Could not find WebJar ($groupId : $artifactId : $webJarVersion)\n${e.getMessage}")
       }
@@ -62,7 +79,7 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
   }
 
   def fileOptions(file: String) = CorsAction {
-    Action { request =>
+    Action {
       Ok.withHeaders(ACCESS_CONTROL_ALLOW_HEADERS -> Seq(CONTENT_TYPE).mkString(","))
     }
   }
@@ -74,8 +91,6 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
       } recover {
         case e: FileNotFoundException =>
           NotFound(s"WebJar Not Found $groupId : $artifactId : $version - ${e.getMessage}")
-        case ure: UnexpectedResponseException =>
-          Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
         case e: Exception =>
           InternalServerError(e.getMessage)
       }
@@ -89,22 +104,11 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
       } recover {
         case e: FileNotFoundException =>
           NotFound(s"WebJar Not Found $groupId : $artifactId : $version - ${e.getMessage}")
-        case ure: UnexpectedResponseException =>
-          Status(ure.response.status)(s"Problems retrieving WebJar ($groupId : $artifactId : $version) - ${ure.response.statusText}")
         case e: Exception =>
-          Logger.error(s"Error getting numFiles for $groupId $artifactId $version", e)
+          logger.error(s"Error getting numFiles for $groupId $artifactId $version", e)
           InternalServerError(e.getMessage)
       }
     }
-  }
-
-  case class CorsAction[A](action: Action[A]) extends Action[A] {
-
-    def apply(request: Request[A]): Future[Result] = {
-      action(request).map(result => result.withHeaders(ACCESS_CONTROL_ALLOW_ORIGIN -> "*"))
-    }
-
-    lazy val parser = action.parser
   }
 
   def corsPreflight(path: String) = Action {
@@ -114,26 +118,15 @@ class Application @Inject() (config: Configuration, memcache: Memcache, mavenCen
     )
   }
 
+  case class CorsAction[A](action: Action[A]) extends Action[A] {
 
-  //// From Play's Asset controller
+    def apply(request: Request[A]): Future[Result] = {
+      action(request).map(result => result.withHeaders(ACCESS_CONTROL_ALLOW_ORIGIN -> "*"))
+    }
 
-  private val timeZoneCode = "GMT"
+    lazy val parser = action.parser
 
-  //Dateformatter is immutable and threadsafe
-  private val df: DateTimeFormatter =
-    DateTimeFormat.forPattern("EEE, dd MMM yyyy HH:mm:ss '" + timeZoneCode + "'").withLocale(java.util.Locale.ENGLISH).withZone(DateTimeZone.forID(timeZoneCode))
-
-  //Dateformatter is immutable and threadsafe
-  private val dfp: DateTimeFormatter =
-    DateTimeFormat.forPattern("EEE, dd MMM yyyy HH:mm:ss").withLocale(java.util.Locale.ENGLISH).withZone(DateTimeZone.forID(timeZoneCode))
-
-  private lazy val defaultCharSet = config.getString("default.charset").getOrElse("utf-8")
-
-  private def addCharsetIfNeeded(mimeType: String): String =
-    if (MimeTypes.isText(mimeType))
-      "; charset=" + defaultCharSet
-    else ""
-
-  ////
+    override def executionContext: ExecutionContext = action.executionContext
+  }
 
 }
