@@ -5,7 +5,6 @@ import java.net.URL
 
 import javax.inject.{Inject, Singleton}
 import play.api._
-import play.api.cache.AsyncCacheApi
 import play.api.http.{AcceptEncoding, FileMimeTypes, HttpErrorHandler}
 import play.api.libs.json.Json
 import play.api.mvc._
@@ -17,7 +16,7 @@ import scala.util.Try
 
 
 @Singleton
-class Application @Inject() (config: Configuration, cache: AsyncCacheApi, mavenCentral: MavenCentral, fileMimeTypes: FileMimeTypes, assetsConfiguration: AssetsConfiguration, httpErrorHandler: HttpErrorHandler) extends InjectedController with Logging {
+class Application @Inject() (mavenCentral: MavenCentral, fileMimeTypes: FileMimeTypes, assetsConfiguration: AssetsConfiguration, httpErrorHandler: HttpErrorHandler) extends InjectedController with Logging {
 
   val webJarAssetsMetadata = new AssetsMetadata {
     private lazy val assetInfoCache = new SelfPopulatingMap[String, AssetInfo]()
@@ -66,7 +65,7 @@ class Application @Inject() (config: Configuration, cache: AsyncCacheApi, mavenC
 
           maybeFile.fold(Future.failed[Result](new FileNotFoundException(s"$file not found in WebJar"))) { webJarFile =>
             val name = jarFile.getAbsolutePath + "!/" + webJarFile
-            webJarAssetsBuilder.at(name)(request)
+            webJarAssetsBuilder.at("", name, true)(request)
           }
         }
       } recover {

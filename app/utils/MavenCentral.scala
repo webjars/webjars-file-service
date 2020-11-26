@@ -12,7 +12,7 @@ import play.api.cache.AsyncCacheApi
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
-import scala.util.{Random, Success, Try}
+import scala.util.{Random, Success, Try, Using}
 
 class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
 
@@ -20,7 +20,8 @@ class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
 
   val baseJarUrl = config.get[String]("webjars.jarUrl")
 
-  def getFile(groupId: String, artifactId: String, version: String): Try[File] = {
+  // todo: lock file for concurrent optimization?
+  def getFile(groupId: String, artifactId: String, version: String, retry: Boolean = true): Try[File] = {
     val jarFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
 
     if (jarFile.exists()) {
@@ -29,25 +30,27 @@ class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
     else {
       val tryFileInputStream = getFileInputStream(baseJarUrl, groupId, artifactId, version)
 
-      val trySave = tryFileInputStream.flatMap { fileInputStream =>
-        val randomString = Random.alphanumeric.take(8).mkString
-        val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar-tmp-$randomString")
-
-        // write to the fs
-        val tryCopy = Try(Files.copy(fileInputStream, tmpFile.toPath))
-        val tryMove = tryCopy.flatMap { _ =>
-          fileInputStream.close()
-          Try(Files.move(tmpFile.toPath, jarFile.toPath)).map(_.toFile)
+      tryFileInputStream.flatMap { fileInputStream =>
+        val trySave = Using(fileInputStream) { inputStream =>
+          val randomString = Random.alphanumeric.take(8).mkString
+          val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar-tmp-$randomString")
+          Files.copy(inputStream, tmpFile.toPath)
+          tmpFile
+        } flatMap { f =>
+          if (jarFile.exists()) {
+            Success(jarFile)
+          }
+          else {
+            Try(Files.move(f.toPath, jarFile.toPath)).map(_.toFile)
+          }
         }
 
-        tryMove
-      }
+        if (trySave.isFailure) {
+          jarFile.delete()
+        }
 
-      if (trySave.isFailure) {
-        jarFile.delete()
+        trySave
       }
-
-      trySave
     }
   }
 
@@ -67,20 +70,15 @@ class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
 
           val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
 
-          tryTmpFileInputStream.map { tmpFileInputStream =>
-            val jarInputStream = new JarInputStream(tmpFileInputStream)
-
-            val webJarFiles = Iterator.continually(jarInputStream.getNextJarEntry).
-              takeWhile(_ != null).
-              filterNot(_.isDirectory).
-              map(_.getName).
-              filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
-              toList
-
-            jarInputStream.close()
-            tmpFileInputStream.close()
-
-            webJarFiles
+          tryTmpFileInputStream.flatMap { tmpFileInputStream =>
+            Using(new JarInputStream(tmpFileInputStream)) { jarInputStream =>
+                Iterator.continually(jarInputStream.getNextJarEntry).
+                  takeWhile(_ != null).
+                  filterNot(_.isDirectory).
+                  map(_.getName).
+                  filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
+                  toList
+            }
           }
         }
       }
