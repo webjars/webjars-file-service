@@ -34,6 +34,8 @@ class ApplicationSpec extends PlaySpec with GuiceOneAppPerSuite {
 
   lazy val appController = app.injector.instanceOf[Application]
 
+  implicit lazy val materializer = app.materializer
+
   "file" must {
     "work" in {
       val response = appController.file("org.webjars", "jquery", "3.2.1", "jquery.js")(FakeRequest())
@@ -50,6 +52,27 @@ class ApplicationSpec extends PlaySpec with GuiceOneAppPerSuite {
       val response = appController.file("org.webjars", "jquery", "0.0.0", "jquery.js")(FakeRequest())
       header(CACHE_CONTROL, response) must be (empty)
       status(response) must equal (NOT_FOUND)
+    }
+    "not find the wrong file" in {
+      val response = appController.file("org.webjars.npm", "highlightjs__cdn-assets", "11.4.0", "highlight.min.js")(FakeRequest())
+      status(response) must equal (OK)
+      contentAsString(response) must include ("var hljs=function(){\"use strict\";var e={exports:{}};function n(e){")
+    }
+    "work with webjars where contents are not versioned" in {
+      val response = appController.file("org.webjars.bowergithub.polymer", "polymer", "2.8.0", "types/polymer.d.ts")(FakeRequest())
+      status(response) must equal (OK)
+    }
+    "work with the groupId" in {
+      val result = route(app, FakeRequest(GET, "/files/org.webjars/jquery/3.2.1/jquery.js")).get
+      status(result) must equal (OK)
+    }
+    "work without the groupId" in {
+      val result = route(app, FakeRequest(GET, "/files/jquery/3.2.1/jquery.js")).get
+      status(result) must equal (OK)
+    }
+    "work with bowergithub" in {
+      val result = route(app, FakeRequest(GET, "/files/org.webjars.bowergithub.polymer/polymer/2.8.0/types/polymer.d.ts")).get
+      status(result) must equal (OK)
     }
   }
 

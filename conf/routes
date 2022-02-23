@@ -1,12 +1,9 @@
 # Routes
 # This file defines all application routes (Higher priority routes first)
 # ~~~~
-
-GET            /files/org.webjars/:artifactId/:version/*file              controllers.Application.file(groupId = "org.webjars", artifactId, version, file)
-GET            /files/org.webjars.bower/:artifactId/:version/*file        controllers.Application.file(groupId = "org.webjars.bower", artifactId, version, file)
-GET            /files/org.webjars.npm/:artifactId/:version/*file          controllers.Application.file(groupId = "org.webjars.npm", artifactId, version, file)
-GET            /files/:artifactId/:version/*file                          controllers.Application.file(groupId = "org.webjars", artifactId, version, file)
-OPTIONS        /files/*file                                               controllers.Application.fileOptions(file)
+GET            /files/$groupId<org.webjars[^/]*>/:artifactId/:version/*file  controllers.Application.file(groupId, artifactId, version, file)
+GET            /files/:artifactId/:version/*file                             controllers.Application.file(groupId = "org.webjars", artifactId, version, file)
+OPTIONS        /files/*file                                                  controllers.Application.fileOptions(file)
 
 GET            /listfiles/:artifactId/:version                            controllers.Application.listFiles(groupId = "org.webjars", artifactId, version)
 GET            /numfiles/:artifactId/:version                             controllers.Application.numFiles(groupId = "org.webjars", artifactId, version)

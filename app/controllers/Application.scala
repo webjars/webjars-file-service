@@ -52,15 +52,21 @@ class Application @Inject() (mavenCentral: MavenCentral, fileMimeTypes: FileMime
 
   def file(groupId: String, artifactId: String, webJarVersion: String, file: String) = CorsAction {
     Action.async { request =>
-      val pathPrefix = s"META-INF/resources/webjars/$artifactId/"
-
       Future.fromTry {
         mavenCentral.getFile(groupId, artifactId, webJarVersion)
       } flatMap { jarFile =>
+        val pathPrefix = s"META-INF/resources/webjars/$artifactId"
         mavenCentral.fetchFileList(groupId, artifactId, webJarVersion).flatMap { webJarFiles =>
-          val maybeFile = webJarFiles.find { webJarFile =>
-            // allows for paths where the path may not include the WebJar version
-            webJarFile.startsWith(pathPrefix) && webJarFile.endsWith(s"/$file")
+          val maybeFileWithVersion = webJarFiles.find { webJarFile =>
+            webJarFile == s"$pathPrefix/$webJarVersion/$file"
+          }
+
+          val maybeFile = maybeFileWithVersion.orElse {
+            webJarFiles.find { webJarFile =>
+              // allows for paths where the path may not include the WebJar version
+              val pathWithoutVersion = webJarFile.stripPrefix(pathPrefix + "/")
+              pathWithoutVersion == file
+            }
           }
 
           maybeFile.fold(Future.failed[Result](new FileNotFoundException(s"$file not found in WebJar"))) { webJarFile =>
