@@ -18,7 +18,7 @@ libraryDependencies ++= Seq(
   "org.apache.commons" % "commons-io" % "1.3.2",
   "com.github.mumoshu" %% "play2-memcached-play28" % "0.11.0",
   "org.scalatestplus.play" %% "scalatestplus-play" % "5.1.0" % Test,
-  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.40.14" % Test
+  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.40.15" % Test
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
