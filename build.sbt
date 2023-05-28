@@ -11,7 +11,7 @@ libraryDependencies ++= Seq(
   cacheApi,
 
   // https://github.com/playframework/playframework/releases/2.8.15
-  "com.google.inject" % "guice" % "5.1.0",
+  "com.google.inject" % "guice" % "7.0.0",
   "com.google.inject.extensions" % "guice-assistedinject" % "5.1.0",
 
   "org.webjars" %% "webjars-play" % "2.8.18",
