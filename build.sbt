@@ -1,26 +1,30 @@
-enablePlugins(PlayScala)
-
 name := "webjars-file-service"
 
-scalaVersion := "2.13.11"
+scalaVersion := "3.3.0"
+
+val zioVersion = "2.0.13"
 
 libraryDependencies ++= Seq(
-  ws,
-  guice,
-  filters,
-  cacheApi,
+  "dev.zio" %% "zio"                 % zioVersion,
+  "dev.zio" %% "zio-concurrent"      % zioVersion,
+  "dev.zio" %% "zio-cache"           % "0.2.3",
+  "dev.zio" %% "zio-logging"         % "2.1.13",
+  "dev.zio" %% "zio-direct"          % "1.0.0-RC7",
+  "dev.zio" %% "zio-direct-streams"  % "1.0.0-RC7",
+  "dev.zio" %% "zio-http"            % "3.0.0-RC2",
+  "dev.zio" %% "zio-redis"           % "0.2.0",
+  "dev.zio" %% "zio-schema-protobuf" % "0.4.11",
 
-  // https://github.com/playframework/playframework/releases/2.8.15
-  "com.google.inject" % "guice" % "5.1.0",
-  "com.google.inject.extensions" % "guice-assistedinject" % "5.1.0",
+  "org.slf4j" % "slf4j-simple" % "2.0.7",
 
-  "org.webjars" %% "webjars-play" % "2.8.18",
-  "org.apache.commons" % "commons-io" % "1.3.2",
-  "com.github.mumoshu" %% "play2-memcached-play28" % "0.11.0",
-  "org.scalatestplus.play" %% "scalatestplus-play" % "5.1.0" % Test,
-  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.40.17" % Test
+  "com.jamesward" %% "zio-mavencentral" % "0.0.2",
+
+  "dev.zio" %% "zio-test"           % zioVersion % Test,
+  "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
+  "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
+  "com.dimafeng" %% "testcontainers-scala-core" % "0.40.17" % Test,
 )
 
-javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
+resolvers ++= Resolver.sonatypeOssRepos("staging")
 
-Test / fork := true
+fork := true

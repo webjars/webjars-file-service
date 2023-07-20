@@ -1,7 +1,2 @@
-// The Play plugin
-addSbtPlugin("com.typesafe.play" % "sbt-plugin" % "2.8.19")
-
-// https://github.com/sbt/sbt/issues/7007
-ThisBuild / libraryDependencySchemes ++= Seq(
-  "org.scala-lang.modules" %% "scala-xml" % VersionScheme.Always
-)
+addSbtPlugin("com.github.sbt" % "sbt-native-packager" % "1.9.16")
+addSbtPlugin("io.spray" % "sbt-revolver" % "0.9.1")
