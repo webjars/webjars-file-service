@@ -10,17 +10,13 @@ libraryDependencies ++= Seq(
   filters,
   cacheApi,
 
-  // https://github.com/playframework/playframework/releases/2.8.15
-  "com.google.inject" % "guice" % "5.1.0",
-  "com.google.inject.extensions" % "guice-assistedinject" % "5.1.0",
-
-  "org.webjars" %% "webjars-play" % "2.9.1",
-  "org.apache.commons" % "commons-io" % "1.3.2",
+  "org.webjars" %% "webjars-play" % "3.0.1",
+  "commons-io" % "commons-io" % "2.15.1",
   "com.github.mumoshu" %% "play2-memcached-play28" % "0.11.0",
   "org.scalatestplus.play" %% "scalatestplus-play" % "7.0.1" % Test,
   "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.41.0" % Test
 )
 
-javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
+javacOptions ++= Seq("--release", "11")
 
 Test / fork := true
