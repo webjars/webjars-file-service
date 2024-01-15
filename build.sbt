@@ -14,11 +14,11 @@ libraryDependencies ++= Seq(
   "com.google.inject" % "guice" % "5.1.0",
   "com.google.inject.extensions" % "guice-assistedinject" % "5.1.0",
 
-  "org.webjars" %% "webjars-play" % "2.8.18",
+  "org.webjars" %% "webjars-play" % "2.9.1",
   "org.apache.commons" % "commons-io" % "1.3.2",
   "com.github.mumoshu" %% "play2-memcached-play28" % "0.11.0",
-  "org.scalatestplus.play" %% "scalatestplus-play" % "5.1.0" % Test,
-  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.40.17" % Test
+  "org.scalatestplus.play" %% "scalatestplus-play" % "7.0.1" % Test,
+  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.41.0" % Test
 )
 
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
