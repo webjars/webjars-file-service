@@ -2,7 +2,7 @@ enablePlugins(PlayScala)
 
 name := "webjars-file-service"
 
-scalaVersion := "2.13.13"
+scalaVersion := "2.13.14"
 
 libraryDependencies ++= Seq(
   ws,
