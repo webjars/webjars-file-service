@@ -4,12 +4,12 @@ import java.io.{File, InputStream}
 import java.net.{URL, URLEncoder}
 import java.nio.file.Files
 import java.util.jar.JarInputStream
-
 import javax.inject.Inject
 import org.webjars.WebJarAssetLocator
 import play.api.Configuration
 import play.api.cache.AsyncCacheApi
 
+import java.util.concurrent.ConcurrentHashMap
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.util.{Random, Success, Try, Using}
@@ -18,38 +18,48 @@ class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
 
   lazy val tempDir: File = Files.createTempDirectory("webjars").toFile
 
+  private val ongoingDownloads = new ConcurrentHashMap[(String, String, String), Future[File]]()
+
   val baseJarUrl = config.get[String]("webjars.jarUrl")
 
-  // todo: lock file for concurrent optimization?
-  def getFile(groupId: String, artifactId: String, version: String, retry: Boolean = true): Try[File] = {
+  def getFile(groupId: String, artifactId: String, version: String): Future[File] = {
     val jarFile = new File(tempDir, s"$groupId-$artifactId-$version.jar")
-
     if (jarFile.exists()) {
-      Success(jarFile)
+      Future.successful(jarFile)
     }
     else {
-      val tryFileInputStream = getFileInputStream(baseJarUrl, groupId, artifactId, version)
+      Option(ongoingDownloads.get((groupId, artifactId, version))).getOrElse {
+        val tryFileInputStream = getFileInputStream(baseJarUrl, groupId, artifactId, version)
 
-      tryFileInputStream.flatMap { fileInputStream =>
-        val trySave = Using(fileInputStream) { inputStream =>
-          val randomString = Random.alphanumeric.take(8).mkString
-          val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar-tmp-$randomString")
-          Files.copy(inputStream, tmpFile.toPath)
-          tmpFile
-        } flatMap { f =>
-          if (jarFile.exists()) {
-            Success(jarFile)
-          }
-          else {
-            Try(Files.move(f.toPath, jarFile.toPath)).map(_.toFile)
+        val f = Future.fromTry {
+          tryFileInputStream.flatMap { fileInputStream =>
+            val trySave = Using(fileInputStream) { inputStream =>
+              val randomString = Random.alphanumeric.take(8).mkString
+              val tmpFile = new File(tempDir, s"$groupId-$artifactId-$version.jar-tmp-$randomString")
+              Files.copy(inputStream, tmpFile.toPath)
+              tmpFile
+            } flatMap { f =>
+              if (jarFile.exists()) {
+                Success(jarFile)
+              }
+              else {
+                Try(Files.move(f.toPath, jarFile.toPath)).map(_.toFile)
+              }
+            }
+
+            if (trySave.isFailure) {
+              jarFile.delete()
+            }
+
+            trySave
           }
         }
 
-        if (trySave.isFailure) {
-          jarFile.delete()
+        f.onComplete { _ =>
+          ongoingDownloads.remove((groupId, artifactId, version))
         }
 
-        trySave
+        f
       }
     }
   }
@@ -65,19 +75,18 @@ class MavenCentral @Inject() (config: Configuration, cache: AsyncCacheApi) {
     val cacheKey = s"listfiles-$groupId-$artifactId-$version"
 
     cache.getOrElseUpdate(cacheKey) {
-      Future.fromTry {
-        getFile(groupId, artifactId, version).flatMap { jarFile =>
+      getFile(groupId, artifactId, version).flatMap { jarFile =>
+        val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
 
-          val tryTmpFileInputStream = Try(Files.newInputStream(jarFile.toPath))
-
+        Future.fromTry {
           tryTmpFileInputStream.flatMap { tmpFileInputStream =>
             Using(new JarInputStream(tmpFileInputStream)) { jarInputStream =>
-                Iterator.continually(jarInputStream.getNextJarEntry).
-                  takeWhile(_ != null).
-                  filterNot(_.isDirectory).
-                  map(_.getName).
-                  filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
-                  toList
+              Iterator.continually(jarInputStream.getNextJarEntry).
+                takeWhile(_ != null).
+                filterNot(_.isDirectory).
+                map(_.getName).
+                filter(_.startsWith(WebJarAssetLocator.WEBJARS_PATH_PREFIX)).
+                toList
             }
           }
         }

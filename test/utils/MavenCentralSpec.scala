@@ -8,6 +8,7 @@ import play.api.inject.ApplicationLifecycle
 import play.api.inject.guice.GuiceApplicationBuilder
 import play.api.test.Helpers._
 
+import java.io.FileNotFoundException
 import scala.concurrent.Future
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.util.Try
@@ -33,14 +34,14 @@ class MavenCentralSpec extends PlaySpec with GuiceOneAppPerSuite {
 
   "getFile" must {
     "work" in {
-      assert(mavenCentral.getFile("org.webjars", "jquery", "3.2.1").isSuccess)
-      assert(mavenCentral.getFile("org.webjars", "jquery", "0.0.1").isFailure)
-      assert(mavenCentral.getFile("org.webjars", "asdfqwer", "0.0.1").isFailure)
+      assert(await(mavenCentral.getFile("org.webjars", "jquery", "3.2.1")).exists())
+      assertThrows[FileNotFoundException](await(mavenCentral.getFile("org.webjars", "jquery", "0.0.1")))
+      assertThrows[FileNotFoundException](await(mavenCentral.getFile("org.webjars", "asdfqwer", "0.0.1")))
     }
     "work in parallel" in {
-      val f1 = Future(mavenCentral.getFile("org.webjars", "jquery", "3.2.0"))
-      val f2 = Future(mavenCentral.getFile("org.webjars", "jquery", "3.2.0"))
-      assert(await(Future.sequence(Seq(f1, f2))).forall(_.isSuccess))
+      val f1 = mavenCentral.getFile("org.webjars", "jquery", "3.2.0")
+      val f2 = mavenCentral.getFile("org.webjars", "jquery", "3.2.0")
+      assert(await(Future.sequence(Seq(f1, f2))).forall(_.exists()))
     }
   }
 
