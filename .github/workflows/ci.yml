@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Read Java version from system.properties
+      id: java-version
+      run: |
+        JAVA_VERSION=$(grep 'java.runtime.version' system.properties | cut -d'=' -f2)
+        echo "version=$JAVA_VERSION" >> $GITHUB_OUTPUT
+        echo "Using Java version: $JAVA_VERSION"
+
+    - name: Set up JDK ${{ steps.java-version.outputs.version }}
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ steps.java-version.outputs.version }}
+        distribution: 'temurin'
+        cache: sbt
+
+    - name: Run tests
+      run: ./sbt test
