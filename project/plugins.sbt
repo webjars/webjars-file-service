@@ -1,5 +1,5 @@
 // The Play plugin
-addSbtPlugin("com.typesafe.play" % "sbt-plugin" % "2.9.10")
+addSbtPlugin("org.playframework" % "sbt-plugin" % "3.0.10")
 
 // https://github.com/sbt/sbt/issues/7007
 ThisBuild / libraryDependencySchemes ++= Seq(
