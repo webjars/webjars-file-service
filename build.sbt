@@ -1,26 +1,29 @@
-enablePlugins(PlayScala)
+enablePlugins(JavaAppPackaging)
 
 name := "webjars-file-service"
 
-scalaVersion := "2.13.18"
+scalaVersion := "3.7.4"
 
-libraryDependencies ++= Seq(
-  ws,
-  guice,
-  filters,
-  cacheApi,
-
-  // https://github.com/playframework/playframework/releases/2.8.15
-  "com.google.inject" % "guice" % "5.1.0",
-  "com.google.inject.extensions" % "guice-assistedinject" % "5.1.0",
-
-  "org.webjars" %% "webjars-play" % "2.8.18",
-  "org.apache.commons" % "commons-io" % "1.3.2",
-  "com.github.mumoshu" %% "play2-memcached-play28" % "0.11.0",
-  "org.scalatestplus.play" %% "scalatestplus-play" % "5.1.0" % Test,
-  "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.44.1" % Test
+scalacOptions ++= Seq(
+  "-language:strictEquality",
 )
 
-javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
+val zioVersion = "2.1.24"
 
-Test / fork := true
+libraryDependencies ++= Seq(
+  "dev.zio" %% "zio"            % zioVersion,
+  "dev.zio" %% "zio-streams"    % zioVersion,
+  "dev.zio" %% "zio-concurrent" % zioVersion,
+  "dev.zio" %% "zio-http"       % "3.7.4",
+
+  "com.jamesward" %% "zio-mavencentral" % "0.1.0",
+
+  "org.slf4j" % "slf4j-simple" % "2.0.17",
+
+  "dev.zio" %% "zio-test"     % zioVersion % Test,
+  "dev.zio" %% "zio-test-sbt" % zioVersion % Test,
+)
+
+testFrameworks += new TestFramework("zio.test.sbt.ZTestFramework")
+
+fork := true
