@@ -15,6 +15,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-streams"    % zioVersion,
   "dev.zio" %% "zio-concurrent" % zioVersion,
   "dev.zio" %% "zio-http"       % "3.7.4",
+  "dev.zio" %% "zio-streams-compress-zip" % "1.1.3",
 
   "com.jamesward" %% "zio-mavencentral" % "0.1.0",
 
