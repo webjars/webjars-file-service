@@ -55,17 +55,6 @@ object AppSpec extends ZIOSpecDefault:
         yield assertTrue(response.status == Status.PermanentRedirect, response.header(Header.Location).map(_.renderedValue).contains("/files/org.webjars/jquery/3.2.1/jquery.js"))
       },
 
-//      test("response with groupId matches response without groupId") {
-//        val request1 = Request.get(URL.decode("/files/org.webjars/jquery/3.2.1/jquery.js").toOption.get)
-//        val request2 = Request.get(URL.decode("/files/jquery/3.2.1/jquery.js").toOption.get)
-//        for
-//          response1 <- App.routes.runZIO(request1)
-//          response2 <- App.routes.runZIO(request2)
-//          body1 <- response1.body.asString
-//          body2 <- response2.body.asString
-//        yield assertTrue(body1 == body2)
-//      },
-
       test("returns correct content-type for CSS files") {
         val request = Request.get(URL.decode("/files/org.webjars/bootstrap/3.3.7/css/bootstrap.min.css").toOption.get)
         for
@@ -287,6 +276,6 @@ object AppSpec extends ZIOSpecDefault:
         yield
           assertTrue(response.status == Status.Ok, decompressedBody.contains("jQuery"))
       },
-    ).provideShared(Client.default, ZLayer.succeed(App.serverConfig), Server.live),
+    ).provide(Client.default, ZLayer.succeed(App.serverConfig), Server.live) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
 
-  ).provide(Client.default, Scope.default) // todo: random server port
+  ).provide(Client.default, Scope.default)
