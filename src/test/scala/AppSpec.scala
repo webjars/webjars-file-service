@@ -52,22 +52,22 @@ object AppSpec extends ZIOSpecDefault:
         val request = Request.get(URL.decode("/files/jquery/3.2.1/jquery.js").toOption.get)
         for
           response <- App.routes.runZIO(request)
-        yield assertTrue(response.status == Status.Ok)
+        yield assertTrue(response.status == Status.PermanentRedirect, response.header(Header.Location).map(_.renderedValue).contains("/files/org.webjars/jquery/3.2.1/jquery.js"))
       },
 
-      test("response with groupId matches response without groupId") {
-        val request1 = Request.get(URL.decode("/files/org.webjars/jquery/3.2.1/jquery.js").toOption.get)
-        val request2 = Request.get(URL.decode("/files/jquery/3.2.1/jquery.js").toOption.get)
-        for
-          response1 <- App.routes.runZIO(request1)
-          response2 <- App.routes.runZIO(request2)
-          body1 <- response1.body.asString
-          body2 <- response2.body.asString
-        yield assertTrue(body1 == body2)
-      },
+//      test("response with groupId matches response without groupId") {
+//        val request1 = Request.get(URL.decode("/files/org.webjars/jquery/3.2.1/jquery.js").toOption.get)
+//        val request2 = Request.get(URL.decode("/files/jquery/3.2.1/jquery.js").toOption.get)
+//        for
+//          response1 <- App.routes.runZIO(request1)
+//          response2 <- App.routes.runZIO(request2)
+//          body1 <- response1.body.asString
+//          body2 <- response2.body.asString
+//        yield assertTrue(body1 == body2)
+//      },
 
       test("returns correct content-type for CSS files") {
-        val request = Request.get(URL.decode("/files/bootstrap/3.3.7/css/bootstrap.min.css").toOption.get)
+        val request = Request.get(URL.decode("/files/org.webjars/bootstrap/3.3.7/css/bootstrap.min.css").toOption.get)
         for
           response <- App.routes.runZIO(request)
         yield
@@ -77,7 +77,7 @@ object AppSpec extends ZIOSpecDefault:
 
     suite("conditional requests")(
       test("returns 304 when ETag matches") {
-        val path = "/files/jquery/3.2.1/jquery.js"
+        val path = "/files/org.webjars/jquery/3.2.1/jquery.js"
         val request1 = Request.get(URL.decode(path).toOption.get)
         for
           response1 <- App.routes.runZIO(request1)
@@ -89,7 +89,7 @@ object AppSpec extends ZIOSpecDefault:
       },
 
       test("returns 304 when If-Modified-Since matches") {
-        val path = "/files/jquery/3.2.1/jquery.js"
+        val path = "/files/org.webjars/jquery/3.2.1/jquery.js"
         val request1 = Request.get(URL.decode(path).toOption.get)
         for
           response1 <- App.routes.runZIO(request1)
@@ -103,7 +103,7 @@ object AppSpec extends ZIOSpecDefault:
       },
 
       test("returns 200 when If-Modified-Since is before last modified") {
-        val path = "/files/jquery/3.2.1/jquery.js"
+        val path = "/files/org.webjars/jquery/3.2.1/jquery.js"
         val request1 = Request.get(URL.decode(path).toOption.get)
         for
           response1 <- App.routes.runZIO(request1)
@@ -118,8 +118,16 @@ object AppSpec extends ZIOSpecDefault:
     ),
 
     suite("listfiles endpoint")(
-      test("returns JSON array of files") {
+      test("redirects to path with groupId") {
         val request = Request.get(URL.decode("/listfiles/jquery/3.2.1").toOption.get)
+        for
+          response <- App.routes.runZIO(request)
+        yield
+          assertTrue(response.status == Status.PermanentRedirect, response.header(Header.Location).map(_.renderedValue).contains("/listfiles/org.webjars/jquery/3.2.1"))
+      },
+
+      test("works with explicit groupId") {
+        val request = Request.get(URL.decode("/listfiles/org.webjars/jquery/3.2.1").toOption.get)
         for
           response <- App.routes.runZIO(request)
           body <- response.body.asString
@@ -127,22 +135,15 @@ object AppSpec extends ZIOSpecDefault:
           assertTrue(response.status == Status.Ok, body.startsWith("["), body.contains("jquery.js"))
       },
 
-      test("works with explicit groupId") {
-        val request = Request.get(URL.decode("/listfiles/org.webjars/jquery/3.2.1").toOption.get)
-        for
-          response <- App.routes.runZIO(request)
-        yield assertTrue(response.status == Status.Ok)
-      },
-
       test("returns 404 for non-existent webjar") {
-        val request = Request.get(URL.decode("/listfiles/nonexistent-webjar/1.0.0").toOption.get)
+        val request = Request.get(URL.decode("/listfiles/org.webjars/nonexistent-webjar/1.0.0").toOption.get)
         for
           response <- App.routes.runZIO(request)
         yield assertTrue(response.status == Status.NotFound)
       },
 
       test("has CORS header") {
-        val request = Request.get(URL.decode("/listfiles/jquery/3.2.1").toOption.get)
+        val request = Request.get(URL.decode("/listfiles/org.webjars/jquery/3.2.1").toOption.get)
         for
           response <- (App.routes @@ App.corsMiddleware).runZIO(request)
         yield assertTrue(response.headers.get(Header.AccessControlAllowOrigin).isDefined)
@@ -150,13 +151,12 @@ object AppSpec extends ZIOSpecDefault:
     ),
 
     suite("numfiles endpoint")(
-      test("returns correct count") {
+      test("redirects to path with groupId") {
         val request = Request.get(URL.decode("/numfiles/jquery/3.2.1").toOption.get)
         for
           response <- App.routes.runZIO(request)
-          body <- response.body.asString
         yield
-          assertTrue(response.status == Status.Ok, body.trim == "4")
+          assertTrue(response.status == Status.PermanentRedirect, response.header(Header.Location).map(_.renderedValue).contains("/numfiles/org.webjars/jquery/3.2.1"))
       },
 
       test("works with explicit groupId") {
@@ -171,7 +171,7 @@ object AppSpec extends ZIOSpecDefault:
 
     suite("CORS")(
       test("OPTIONS /files/* returns CORS headers") {
-        val request = Request(method = Method.OPTIONS, url = URL.decode("/files/jquery/3.2.1/jquery.js").toOption.get)
+        val request = Request(method = Method.OPTIONS, url = URL.decode("/files/org.webjars/jquery/3.2.1/jquery.js").toOption.get)
         for
           response <- (App.routes @@ App.corsMiddleware).runZIO(request)
         yield
@@ -187,7 +187,7 @@ object AppSpec extends ZIOSpecDefault:
       },
 
       test("GET responses include CORS header") {
-        val request = Request.get(URL.decode("/files/jquery/3.2.1/jquery.js").toOption.get)
+        val request = Request.get(URL.decode("/files/org.webjars/jquery/3.2.1/jquery.js").toOption.get)
         for
           response <- (App.routes @@ App.corsMiddleware).runZIO(request)
         yield assertTrue(response.headers.get(Header.AccessControlAllowOrigin).isDefined)
@@ -218,7 +218,7 @@ object AppSpec extends ZIOSpecDefault:
       test("returns list of files in webjar") {
         for
           stream <- App.fetchFileList(MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("3.2.1")))
-          files <- stream.runCollect
+          files <- stream.contents.runCollect
         yield
           assertTrue(files.exists(_.contains("jquery.js")))
       },
@@ -252,7 +252,7 @@ object AppSpec extends ZIOSpecDefault:
       test("returns gzip encoded response when client accepts gzip") {
         for
           port <- Server.install(App.routes @@ App.corsMiddleware)
-          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/files/jquery/3.2.1/jquery.js"))
+          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/files/org.webjars/jquery/3.2.1/jquery.js"))
           request = Request.get(url).addHeader(Header.AcceptEncoding(Header.AcceptEncoding.GZip()))
           // Use a client that doesn't automatically decompress
           response <- ZClient.batched(request)
@@ -264,7 +264,7 @@ object AppSpec extends ZIOSpecDefault:
       test("returns uncompressed response when client does not accept gzip") {
         for
           port <- Server.install(App.routes @@ App.corsMiddleware)
-          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/files/jquery/3.2.1/jquery.js"))
+          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/files/org.webjars/jquery/3.2.1/jquery.js"))
           request = Request.get(url)
           response <- ZClient.batched(request)
           body <- response.body.asString
@@ -275,7 +275,7 @@ object AppSpec extends ZIOSpecDefault:
       test("gzip compressed response can be decompressed") {
         for
           port <- Server.install(App.routes @@ App.corsMiddleware)
-          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/files/jquery/3.2.1/jquery.js"))
+          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/files/org.webjars/jquery/3.2.1/jquery.js"))
           request = Request.get(url).addHeader(Header.AcceptEncoding(Header.AcceptEncoding.GZip()))
           response <- ZClient.batched(request)
           compressedBody <- response.body.asArray
@@ -287,6 +287,6 @@ object AppSpec extends ZIOSpecDefault:
         yield
           assertTrue(response.status == Status.Ok, decompressedBody.contains("jQuery"))
       },
-    ),
+    ).provideShared(Client.default, ZLayer.succeed(App.serverConfig), Server.live),
 
-  ).provide(Client.default, Scope.default, ZLayer.succeed(App.serverConfig), Server.live)
+  ).provide(Client.default, Scope.default) // todo: random server port
