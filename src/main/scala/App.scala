@@ -187,12 +187,19 @@ object App extends ZIOAppDefault:
       Method.OPTIONS / trailing -> corsPreflightHandler,
     )
 
-  val serverConfig: Server.Config = Server.Config.default.port(9000).copy(
-    responseCompression = Some(Server.Config.ResponseCompressionConfig.default)
-  )
+  val serverConfig =
+    ZLayer.fromZIO:
+      for
+        system <- ZIO.system
+        maybePort <- system.env("PORT")
+      yield
+        maybePort.flatMap(_.toIntOption).fold(Server.Config.default)(Server.Config.default.port).copy(
+          responseCompression = Some(Server.Config.ResponseCompressionConfig.default)
+        )
+
 
   val serverLayer: ZLayer[Any, Throwable, Server] =
-    ZLayer.succeed(serverConfig) >>> Server.live
+    serverConfig >>> Server.live
 
   override val run =
     Server.serve(routes @@ corsMiddleware).provide(
