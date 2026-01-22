@@ -12,7 +12,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: Read Java version from system.properties
       id: java-version
@@ -22,7 +22,7 @@ jobs:
         echo "Using Java version: $JAVA_VERSION"
 
     - name: Set up JDK ${{ steps.java-version.outputs.version }}
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v5
       with:
         java-version: ${{ steps.java-version.outputs.version }}
         distribution: 'temurin'
