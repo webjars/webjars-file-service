@@ -18,6 +18,7 @@ object App extends ZIOAppDefault:
   val webJarsPathPrefix = "META-INF/resources/webjars"
   type TmpDir = File
 
+  // todo: use CORS Middleware from ZIO HTTP: https://ziohttp.com/reference/aop/middleware#access-control-allow-origin-cors-middleware
   // CORS middleware that adds Access-Control-Allow-Origin: * to all responses
   val corsMiddleware: HandlerAspect[Any, Unit] =
     HandlerAspect.interceptOutgoingHandler(Handler.fromFunction[Response] { response =>
@@ -105,6 +106,7 @@ object App extends ZIOAppDefault:
     yield
       FileDetails(webJarDetails.etag, webJarDetails.lastModified, fileInJar)
 
+  // todo: maybe use Handler.fromFileZIO instead? We'd just need to make sure the file's last-modified is set correctly.
   def serveFile(gav: MavenCentral.GroupArtifactVersion, fileDetails: FileDetails, request: Request): ZIO[Client & TmpDir & Scope, Throwable, Response] =
     val maybeFileExt = fileDetails.file.split('.').lastOption
     val maybeMimeType = maybeFileExt.flatMap(MediaType.forFileExtension)
@@ -253,7 +255,7 @@ object App extends ZIOAppDefault:
     ZLayer.succeed(Files.createTempDirectory("webjars").toFile)
 
   override val run =
-    Server.serve(routes @@ corsMiddleware).provide(
+    Server.serve(routes @@ corsMiddleware @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(Header.UserAgent))).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
       tmpDirLayer
