@@ -215,25 +215,25 @@ object AppSpec extends ZIOSpecDefault:
 
     suite("readFileFromJar")(
       test("file exists") {
-        val url = App.webJarUrl(MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("3.2.1")))
+        val gav = MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("3.2.1"))
         for
-          file <- App.readFileFromJar(url, App.webJarsPathPrefix + "/jquery/3.2.1/jquery.js").via(ZPipeline.utf8Decode).runHead
+          file <- App.readFileFromJar(gav, App.webJarsPathPrefix + "/jquery/3.2.1/jquery.js").via(ZPipeline.utf8Decode).runHead
         yield
           assertTrue(file.exists(_.contains("jQuery")))
       },
       test("file not found") {
-        val url = App.webJarUrl(MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("3.2.1")))
+        val gav = MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("3.2.1"))
         for
-          error <- App.readFileFromJar(url, App.webJarsPathPrefix + "/jquery/3.2.1/asdf.js").runCollect.flip
+          error <- App.readFileFromJar(gav, App.webJarsPathPrefix + "/jquery/3.2.1/asdf.js").runCollect.flip
         yield
-          assertTrue(error.isInstanceOf[java.io.FileNotFoundException])
+          assertTrue(error.isInstanceOf[java.nio.file.NoSuchFileException])
       },
       test("webjar not found") {
-        val url = App.webJarUrl(MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("0.0.0")))
+        val gav = MavenCentral.GroupArtifactVersion(MavenCentral.GroupId("org.webjars"), MavenCentral.ArtifactId("jquery"), MavenCentral.Version("3.2.1"))
         for
-          error <- App.readFileFromJar(url, App.webJarsPathPrefix + "/jquery/0.0.0/jquery.js").runCollect.flip
+          error <- App.readFileFromJar(gav, App.webJarsPathPrefix + "/jquery/0.0.0/jquery.js").runCollect.flip
         yield
-          assertTrue(error.isInstanceOf[java.io.FileNotFoundException])
+          assertTrue(error.isInstanceOf[java.nio.file.NoSuchFileException])
       },
     ),
 
@@ -276,6 +276,6 @@ object AppSpec extends ZIOSpecDefault:
         yield
           assertTrue(response.status == Status.Ok, decompressedBody.contains("jQuery"))
       },
-    ).provide(Client.default, App.serverLayer) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
+    ).provide(Client.default, App.serverLayer, App.tmpDirLayer) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
 
-  ).provide(Client.default, Scope.default)
+  ).provide(Client.default, Scope.default, App.tmpDirLayer)

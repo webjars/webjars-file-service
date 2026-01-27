@@ -1,13 +1,12 @@
 import com.jamesward.zio_mavencentral.MavenCentral
 import zio.*
-import zio.compress.ZipUnarchiver
 import zio.http.*
-import zio.http.Header.{AccessControlAllowHeaders, AccessControlAllowMethods, AccessControlAllowOrigin}
 import zio.http.codec.PathCodec
-import zio.stream.ZStream
+import zio.stream.{ZPipeline, ZStream}
 
-import java.io.{FileNotFoundException, IOException}
-import java.net.URI
+import java.io.{File, FileNotFoundException}
+import java.nio.file.{Files, StandardOpenOption}
+import scala.jdk.CollectionConverters.*
 
 object App extends ZIOAppDefault:
 
@@ -17,11 +16,12 @@ object App extends ZIOAppDefault:
 
   val baseJarUrl = zio.http.URL.decode("https://repo1.maven.org/maven2/").toOption.get
   val webJarsPathPrefix = "META-INF/resources/webjars"
+  type TmpDir = File
 
   // CORS middleware that adds Access-Control-Allow-Origin: * to all responses
   val corsMiddleware: HandlerAspect[Any, Unit] =
     HandlerAspect.interceptOutgoingHandler(Handler.fromFunction[Response] { response =>
-      response.addHeader(AccessControlAllowOrigin.All)
+      response.addHeader(Header.AccessControlAllowOrigin.All)
     })
 
   def gavPath(gav: MavenCentral.GroupArtifactVersion): Path =
@@ -32,39 +32,80 @@ object App extends ZIOAppDefault:
 
   case class JarDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], contents: ZStream[Any, Throwable, String])
 
-  def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[Client, Throwable, JarDetails] =
-    val url = webJarUrl(gav)
-    for
-      resp <- Client.batched(Request.get(url)).filterOrElseWith(_.status.isSuccess)(resp => ZIO.fail(FileNotFoundException(s"JAR not found: $url (status: ${resp.status})")))
-    yield
-      JarDetails(
-        resp.header(Header.ETag),
-        resp.header(Header.LastModified),
-        resp.body.asStream.via(ZipUnarchiver.unarchive).map(_._1).filterNot(_.isDirectory).map(_.name).filter(_.startsWith(webJarsPathPrefix))
-      )
+  type WebJarTmpDir = File
 
-  def readFileFromJar(jarFile: URL, entryPath: String): ZStream[Any, IOException, Byte] =
-    val jarUrl = URI.create(s"jar:$jarFile!/$entryPath").toURL
-    ZStream.fromInputStreamZIO(ZIO.attemptBlockingIO(jarUrl.openStream()))
+  extension (webJarTmpDir: WebJarTmpDir)
+    def etagFile = File(webJarTmpDir, "etag")
+    def lastmodifiedFile = File(webJarTmpDir, "lastmodified")
+    def filelist = File(webJarTmpDir, "filelist")
+
+  def gavTmpDir(gav: MavenCentral.GroupArtifactVersion): ZIO[TmpDir, Nothing, WebJarTmpDir] = ZIO.serviceWith[TmpDir](tmpDir => File(tmpDir, gav.toString))
+
+  def saveFile(gav:MavenCentral.GroupArtifactVersion): ZIO[Client & TmpDir & Scope, Throwable, File] =
+    gavTmpDir(gav).filterOrElseWith(_.exists()):
+      webJarDir =>
+        val url = webJarUrl(gav)
+        MavenCentral.downloadAndExtractZip(url, webJarDir)
+          .flatMap:
+            info =>
+              // todo: to stream
+              ZIO.attemptBlockingIO:
+                info.maybeEtag.foreach:
+                  etag =>
+                    Files.writeString(webJarDir.etagFile.toPath, etag.renderedValue)
+
+                info.maybeLastModified.foreach:
+                  lastModified =>
+                    Files.writeString(webJarDir.lastmodifiedFile.toPath, Header.LastModified.render(Header.LastModified(lastModified)))
+
+                val webJarFiles = info.value.filter(_.startsWith(webJarsPathPrefix))
+
+                Files.write(webJarDir.filelist.toPath, webJarFiles.asJava, StandardOpenOption.CREATE)
+
+                webJarDir
+          .mapError(e => FileNotFoundException(s"WebJar not found: $gav"))
+
+  def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & TmpDir & Scope, Throwable, JarDetails] =
+    saveFile(gav).flatMap:
+      webJarDir =>
+        // todo: to zstream
+        /*
+        //        webJarDir <- gavTmpDir(gav)
+        //        maybeEtag <- ZStream.fromPath(webJarDir.etagFile.toPath).via(ZPipeline.utf8Decode).collectZIO(s => ZIO.fromEither(Header.ETag.parse(s)))
+        //        maybeLastModified <- ZStream.fromPath(webJarDir.lastmodifiedFile.toPath).via(ZPipeline.utf8Decode).collectZIO(s => ZIO.fromEither(Header.LastModified.parse(s)))
+         */
+
+        ZIO.attemptBlockingIO:
+          val maybeEtag = Option.when(webJarDir.etagFile.exists())(Files.readString(webJarDir.etagFile.toPath)).flatMap(Header.ETag.parse(_).toOption)
+          val maybeLastModified = Option.when(webJarDir.lastmodifiedFile.exists())(Files.readString(webJarDir.lastmodifiedFile.toPath)).flatMap(Header.LastModified.parse(_).toOption)
+
+          JarDetails(
+            maybeEtag,
+            maybeLastModified,
+            ZStream.fromPath(File(webJarDir, "filelist").toPath).via(ZPipeline.utf8Decode >>> ZPipeline.splitLines)
+          )
+
+  def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[Client & TmpDir & Scope, Throwable, Byte] =
+    ZStream.fromZIO:
+        saveFile(gav)
+    .flatMap:
+      webJarDir =>
+        ZStream.fromPath(File(webJarDir, entryPath).toPath)
 
   case class FileDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], file: String)
 
-  def findFile(gav: MavenCentral.GroupArtifactVersion, file: Path): ZIO[Client & Scope, Throwable, FileDetails] =
-    val maybeFile =
-      for
-        jarDetails <- fetchFileList(gav)
-        fileList <- jarDetails.contents.runCollect
-      yield
-        fileList.find:
-          fileInJar =>
-            fileInJar == s"$webJarsPathPrefix/${gav.artifactId}/${gav.version}/$file" ||
-              fileInJar == s"$webJarsPathPrefix/${gav.artifactId}/$file" // some webjars don't include version in path
-        .map:
-          fileInJar => FileDetails(jarDetails.etag, jarDetails.lastModified, fileInJar)
+  def findFile(gav: MavenCentral.GroupArtifactVersion, file: Path): ZIO[Client & TmpDir & Scope, Throwable, FileDetails] =
+    for
+      webJarDetails <- fetchFileList(gav)
+      fileInJar <- webJarDetails.contents.find:
+        f =>
+          f == s"$webJarsPathPrefix/${gav.artifactId}/${gav.version}/$file" ||
+            f == s"$webJarsPathPrefix/${gav.artifactId}/$file" // some webjars don't include version in path
+      .runHead.someOrFail(FileNotFoundException(s"$file not found in WebJar"))
+    yield
+      FileDetails(webJarDetails.etag, webJarDetails.lastModified, fileInJar)
 
-    maybeFile.someOrFail(FileNotFoundException(s"$file not found in WebJar"))
-
-  def serveFile(gav: MavenCentral.GroupArtifactVersion, fileDetails: FileDetails, request: Request): Response =
+  def serveFile(gav: MavenCentral.GroupArtifactVersion, fileDetails: FileDetails, request: Request): ZIO[Client & TmpDir & Scope, Throwable, Response] =
     val maybeFileExt = fileDetails.file.split('.').lastOption
     val maybeMimeType = maybeFileExt.flatMap(MediaType.forFileExtension)
 
@@ -89,61 +130,69 @@ object App extends ZIOAppDefault:
       case _ => false
 
     if etagMatches || notModified then
-      Response(
-        status = Status.NotModified,
-        headers = commonHeaders
-      )
+      ZIO.succeed:
+        Response(
+          status = Status.NotModified,
+          headers = commonHeaders
+        )
     else
-      val fileStream = readFileFromJar(webJarUrl(gav), fileDetails.file)
+      val fileStream = readFileFromJar(gav, fileDetails.file)
 
-      Response(
-        status = Status.Ok,
-        headers = commonHeaders,
-        body = Body.fromStreamChunked(fileStream)
-      )
+      Body.fromStreamChunkedEnv(fileStream).map:
+        body =>
+          Response(
+            status = Status.Ok,
+            headers = commonHeaders,
+            body = body
+          )
 
-  def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
+  def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client & TmpDir, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
+    Handler.fromZIO:
+      if gav.groupId.toString.startsWith("org.webjars") then
+        ZIO.scoped:
+          findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
+            e => ZIO.succeed(Response.notFound(e.getMessage))
+      else
+        val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
+        ZIO.succeed(Response.redirect(request.url.path(path), true))
+
+  def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & TmpDir, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     Handler.fromZIO:
       ZIO.scoped:
-        if gav.groupId.toString.startsWith("org.webjars") then
-          findFile(gav, file).map(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
-            e => ZIO.succeed(Response.notFound(e.getMessage))
+        fetchFileList(gav)
+    .flatMap:
+      jarDetails =>
+        val jsonStream: ZStream[Client, Throwable, String] =
+          ZStream.succeed("[") ++
+            jarDetails.contents.map("\"" + _ + "\"").intersperse(",") ++
+            ZStream.succeed("]")
 
-        else
-          val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
-          ZIO.succeed(Response.redirect(request.url.path(path), true))
+        // todo cache headers
+        Handler.fromStreamChunked(jsonStream)
+          .map(_.contentType(MediaType.application.json))
+    .catchAll:
+      e => Response.notFound(e.getMessage).toHandler
 
-  def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
-    Handler.fromZIO(fetchFileList(gav))
-      .flatMap:
-        jarDetails =>
-          val jsonStream: ZStream[Client, Throwable, String] =
-            ZStream.succeed("[") ++
-              jarDetails.contents.map("\"" + _ + "\"").intersperse(",") ++
-              ZStream.succeed("]")
-
-          // todo cache headers
-          Handler.fromStreamChunked(jsonStream)
-            .map(_.contentType(MediaType.application.json))
-      .catchAll:
-        e => Response.notFound(e.getMessage).toHandler
-
-  def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
+  def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & TmpDir, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     // todo cache headers
-    Handler.fromZIO(fetchFileList(gav).flatMap(_.contents.runCount)).map(_.toString).map(Response.text)
-      .catchAll:
-        e => Response.notFound(e.getMessage).toHandler
+    Handler.fromZIO:
+      ZIO.scoped:
+        fetchFileList(gav)
+      .flatMap(_.contents.runCount)
+      .map(num => Response.text(num.toString))
+    .catchAll:
+      e => Response.notFound(e.getMessage).toHandler
 
   val fileOptionsHandler: Handler[Any, Nothing, Request, Response] =
     Handler.fromFunction[Request] { _ =>
-      Response.ok.addHeader(AccessControlAllowHeaders.All)
+      Response.ok.addHeader(Header.AccessControlAllowHeaders.All)
     }
 
   val corsPreflightHandler: Handler[Any, Nothing, Request, Response] =
     Handler.fromFunction[Request] { _ =>
       Response.ok
-        .addHeader(AccessControlAllowOrigin.All)
-        .addHeader(AccessControlAllowMethods(Method.GET))
+        .addHeader(Header.AccessControlAllowOrigin.All)
+        .addHeader(Header.AccessControlAllowMethods(Method.GET))
     }
 
   val robotsTxt =
@@ -174,7 +223,7 @@ object App extends ZIOAppDefault:
     val path = op ++ gav.toPath
     Response.redirect(req.url.path(path), true).toHandler
 
-  val routes: Routes[Client, Response] =
+  val routes: Routes[Client & TmpDir, Response] =
     Routes(
       Method.GET / "files" / groupArtifactVersionPathCodec / trailing -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Path, Request)](fileHandler),
       Method.OPTIONS / "files" / trailing -> fileOptionsHandler,
@@ -197,12 +246,15 @@ object App extends ZIOAppDefault:
           responseCompression = Some(Server.Config.ResponseCompressionConfig.default)
         )
 
-
   val serverLayer: ZLayer[Any, Throwable, Server] =
     serverConfig >>> Server.live
+
+  val tmpDirLayer: ZLayer[Any, Nothing, TmpDir] =
+    ZLayer.succeed(Files.createTempDirectory("webjars").toFile)
 
   override val run =
     Server.serve(routes @@ corsMiddleware).provide(
       serverLayer,
-      Client.default,
+      Client.default.update(_ @@ ZClientAspect.requestLogging()),
+      tmpDirLayer
     )
