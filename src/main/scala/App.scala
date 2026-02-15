@@ -59,7 +59,7 @@ object App extends ZIOAppDefault:
                   lastModified =>
                     Files.writeString(webJarDir.lastmodifiedFile.toPath, Header.LastModified.render(Header.LastModified(lastModified)))
 
-                val webJarFiles = info.value.filter(_.startsWith(webJarsPathPrefix))
+                val webJarFiles = info.value.filter(_.startsWith(webJarsPathPrefix)).toSeq.sorted
 
                 Files.write(webJarDir.filelist.toPath, webJarFiles.asJava, StandardOpenOption.CREATE)
 
