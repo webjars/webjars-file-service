@@ -8,23 +8,13 @@ scalacOptions ++= Seq(
   "-language:strictEquality",
 )
 
-val zioVersion = "2.1.24"
-
 libraryDependencies ++= Seq(
-  "dev.zio" %% "zio"            % zioVersion,
-  "dev.zio" %% "zio-streams"    % zioVersion,
-  "dev.zio" %% "zio-concurrent" % zioVersion,
-  "dev.zio" %% "zio-http"       % "3.10.1",
-  "dev.zio" %% "zio-streams-compress-zip" % "1.1.4",
-
-  "com.jamesward" %% "zio-mavencentral" % "0.5.5",
+  "com.jamesward" %% "zio-mavencentral" % "0.5.9",
 
   "org.slf4j" % "slf4j-simple" % "2.0.17",
 
-  "dev.zio" %% "zio-test"     % zioVersion % Test,
-  "dev.zio" %% "zio-test-sbt" % zioVersion % Test,
+  "dev.zio" %% "zio-test"     % "2.1.24" % Test,
+  "dev.zio" %% "zio-test-sbt" % "2.1.24" % Test,
 )
-
-testFrameworks += new TestFramework("zio.test.sbt.ZTestFramework")
 
 fork := true
