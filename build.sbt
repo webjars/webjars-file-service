@@ -13,8 +13,8 @@ libraryDependencies ++= Seq(
 
   "org.slf4j" % "slf4j-simple" % "2.0.17",
 
-  "dev.zio" %% "zio-test"     % "2.1.24" % Test,
-  "dev.zio" %% "zio-test-sbt" % "2.1.24" % Test,
+  "dev.zio" %% "zio-test"     % "2.1.25" % Test,
+  "dev.zio" %% "zio-test-sbt" % "2.1.25" % Test,
 )
 
 fork := true
