@@ -9,7 +9,7 @@ scalacOptions ++= Seq(
 )
 
 libraryDependencies ++= Seq(
-  "com.jamesward" %% "zio-mavencentral" % "0.5.9",
+  "com.jamesward" %% "zio-mavencentral" % "0.5.10",
 
   "org.slf4j" % "slf4j-simple" % "2.0.17",
 
