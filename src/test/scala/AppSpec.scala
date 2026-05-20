@@ -276,6 +276,6 @@ object AppSpec extends ZIOSpecDefault:
         yield
           assertTrue(response.status == Status.Ok, decompressedBody.contains("jQuery"))
       },
-    ).provide(Client.default, App.serverLayer, App.jarCacheLayer) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
+    ).provide(Client.default, App.serverLayer, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
 
-  ).provide(Client.default, Scope.default, App.jarCacheLayer)
+  ).provide(Client.default, Scope.default, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live)

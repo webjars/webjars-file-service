@@ -38,17 +38,15 @@ object App extends ZIOAppDefault:
         cacheDir,
         JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
         label = "webjar",
-      )
-
-  /**
+      )  /**
    * Look up the `JarHandle` for a webjar GAV. Maps the upstream
    * `NotFoundError` to a `FileNotFoundException` for parity with the
    * previous extracted-dir flow.
    */
-  private def jarHandle(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache, FileNotFoundException, JarCache.JarHandle] =
+  private def jarHandle(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, FileNotFoundException, JarCache.JarHandle] =
     ZIO.serviceWithZIO[JarCache](_.get(gav)).orElseFail(FileNotFoundException(s"WebJar not found: $gav"))
 
-  def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache, Throwable, JarDetails] =
+  def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, JarDetails] =
     jarHandle(gav).map: handle =>
       // Only entries inside `META-INF/resources/webjars/...` are user-visible
       // webjar content; jar metadata files (`META-INF/MANIFEST.MF`, `pom.xml`,
@@ -68,7 +66,7 @@ object App extends ZIOAppDefault:
    * extracted-dir behavior) when the entry is missing — matched by
    * existing tests.
    */
-  def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[Client & JarCache, Throwable, Byte] =
+  def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, Byte] =
     ZStream.fromZIO(jarHandle(gav))
       .flatMap: handle =>
         ZStream.fromZIO(
@@ -82,7 +80,7 @@ object App extends ZIOAppDefault:
    * webjars use in practice (with or without the version segment in
    * the resource path).
    */
-  def findFile(gav: MavenCentral.GroupArtifactVersion, file: Path): ZIO[Client & JarCache, Throwable, FileDetails] =
+  def findFile(gav: MavenCentral.GroupArtifactVersion, file: Path): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, FileDetails] =
     jarHandle(gav).flatMap: handle =>
       val withVersion    = s"$webJarsPathPrefix/${gav.artifactId}/${gav.version}/$file"
       val withoutVersion = s"$webJarsPathPrefix/${gav.artifactId}/$file"
@@ -93,7 +91,7 @@ object App extends ZIOAppDefault:
             if hasNV then ZIO.succeed(FileDetails(handle.meta.maybeEtag, handle.meta.maybeLastModified.map(Header.LastModified(_)), withoutVersion))
             else ZIO.fail(FileNotFoundException(s"$file not found in WebJar"))
 
-  def serveFile(gav: MavenCentral.GroupArtifactVersion, fileDetails: FileDetails, request: Request): ZIO[Client & JarCache, Throwable, Response] =
+  def serveFile(gav: MavenCentral.GroupArtifactVersion, fileDetails: FileDetails, request: Request): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, Response] =
     val maybeFileExt = fileDetails.file.split('.').lastOption
     val maybeMimeType = maybeFileExt.flatMap(MediaType.forFileExtension)
 
@@ -132,7 +130,7 @@ object App extends ZIOAppDefault:
           body    = Body.fromArray(bytes),
         )
 
-  def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client & JarCache, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
+  def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
     Handler.fromZIO:
       if gav.groupId.toString.startsWith("org.webjars") then
         findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
@@ -141,7 +139,7 @@ object App extends ZIOAppDefault:
         val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
         ZIO.succeed(Response.redirect(request.url.path(path), true))
 
-  def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
+  def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     Handler.fromZIO:
       fetchFileList(gav)
     .flatMap:
@@ -157,7 +155,7 @@ object App extends ZIOAppDefault:
     .catchAll:
       e => Response.notFound(e.getMessage).toHandler
 
-  def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
+  def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     // todo cache headers
     Handler.fromZIO:
       fetchFileList(gav)
@@ -202,7 +200,7 @@ object App extends ZIOAppDefault:
     val path = op ++ gav.toPath
     Response.redirect(req.url.path(path), true).toHandler
 
-  val routes: Routes[Client & JarCache, Response] =
+  val routes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
     Routes(
       Method.GET / "files" / groupArtifactVersionPathCodec / trailing -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Path, Request)](fileHandler),
       Method.OPTIONS / "files" / trailing -> fileOptionsHandler,
@@ -232,5 +230,6 @@ object App extends ZIOAppDefault:
     Server.serve(routes @@ corsMiddleware @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(Header.UserAgent))).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
+      MavenCentral.MavenCentralRepo.live,
       jarCacheLayer,
     )
