@@ -1,4 +1,4 @@
-import com.jamesward.zio_mavencentral.{JarCache, MavenCentral}
+import com.jamesward.zio_mavencentral.{GavCacheMiddleware, JarCache, MavenCentral}
 import zio.*
 import zio.http.*
 import zio.http.codec.PathCodec
@@ -21,6 +21,57 @@ object App extends ZIOAppDefault:
     HandlerAspect.interceptOutgoingHandler(Handler.fromFunction[Response] { response =>
       response.addHeader(Header.AccessControlAllowOrigin.All)
     })
+
+  /**
+   * Bracket pair around `GavCacheMiddleware` that adapts it to our
+   * `/files/<groupId>/<artifactId>/<version>/<rest>` URL shape.
+   *
+   * `GavCacheMiddleware` parses GAV from the first three path segments,
+   * so applying it directly to our routes wouldn't match. Instead of
+   * reimplementing the middleware, we briefly rewrite the request path
+   * to drop the `files` segment for the duration of the cache check,
+   * then restore it before the request reaches the route table.
+   *
+   * Composition (outermost → innermost):
+   *
+   *   stripFilesPrefix          // path: /files/g/a/v/rest → /g/a/v/rest
+   *   GavCacheMiddleware.notModified  // 304 short-circuit on /g/a/v/rest
+   *   GavCacheMiddleware.cacheHeaders // stable ETag + LM on /g/a/v/rest
+   *   restoreFilesPrefix        // path: /g/a/v/rest → /files/g/a/v/rest
+   *   routes
+   *
+   * The 304 path's `ETag` is derived from the stripped path (`/g/a/v/rest`).
+   * Stability across dyno cycles is what matters for CDN revalidation;
+   * the absolute ETag value just needs to be self-consistent. Clients
+   * round-trip whatever value we sent, and `notModified` short-circuits
+   * any conditional GET to an immutable GAV path regardless of validator
+   * value, so this is sound.
+   */
+  val stripFilesPrefix: HandlerAspect[Any, Unit] =
+    HandlerAspect.interceptIncomingHandler:
+      Handler.fromFunctionZIO[Request]: request =>
+        val segs = request.path.segments
+        if segs.length >= 1 && segs(0) == "files" then
+          ZIO.succeed((request.updatePath(_.drop(1)), ()))
+        else
+          ZIO.succeed((request, ()))
+
+  val restoreFilesPrefix: HandlerAspect[Any, Unit] =
+    HandlerAspect.interceptIncomingHandler:
+      Handler.fromFunctionZIO[Request]: request =>
+        ZIO.succeed((request.updatePath(p => Path.root / "files" ++ p), ()))
+
+  /**
+   * Background fiber: log `JarCache` size + on-disk bytes once a minute.
+   * Useful for spotting unbounded growth on Heroku's ephemeral disk.
+   * `JarCache` itself has no eviction, so the only natural reset is dyno
+   * restart — these stats let us see how close to that limit we are.
+   */
+  val cacheStatsLogger: ZIO[JarCache, Nothing, Long] =
+    ZIO.serviceWithZIO[JarCache]: cache =>
+      cache.size.zip(cache.totalBytes).flatMap: (jars, bytes) =>
+        ZIO.logInfo(s"cache_stats jars=$jars total_mb=${bytes / 1024 / 1024}")
+    .repeat(Schedule.fixed(60.seconds))
 
   case class JarDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], contents: ZStream[Any, Throwable, String])
 
@@ -133,8 +184,10 @@ object App extends ZIOAppDefault:
   def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
     Handler.fromZIO:
       if gav.groupId.toString.startsWith("org.webjars") then
-        findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
-          e => ZIO.succeed(Response.notFound(e.getMessage))
+        ZIO.serviceWithZIO[JarCache](_.contains(gav)).flatMap: cached =>
+          ZIO.logInfo(s"webjar_cache=${if cached then "HIT" else "MISS"} gav=$gav") *>
+            findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
+              e => ZIO.succeed(Response.notFound(e.getMessage))
       else
         val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
         ZIO.succeed(Response.redirect(request.url.path(path), true))
@@ -227,7 +280,20 @@ object App extends ZIOAppDefault:
     serverConfig >>> Server.live
 
   override val run =
-    Server.serve(routes @@ corsMiddleware @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(Header.UserAgent))).provide(
+    val server = Server.serve(
+      routes
+        @@ restoreFilesPrefix
+        @@ GavCacheMiddleware.cacheHeaders()
+        @@ GavCacheMiddleware.notModified()
+        @@ stripFilesPrefix
+        @@ corsMiddleware
+        @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(
+          Header.UserAgent,
+          Header.IfNoneMatch,
+          Header.IfModifiedSince,
+        ))
+    )
+    (cacheStatsLogger.forkDaemon *> server).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
       MavenCentral.MavenCentralRepo.live,
