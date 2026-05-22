@@ -32,13 +32,19 @@ object App extends ZIOAppDefault:
    * to drop the `files` segment for the duration of the cache check,
    * then restore it before the request reaches the route table.
    *
+   * The bracket is applied **only to the `/files/...` route subset**
+   * (see `filesRoutes`/`otherRoutes` in `run`). Applying it around the
+   * full route table would mis-prefix non-`/files` paths like
+   * `/listfiles/...`, `/numfiles/...`, and `/robots.txt`, producing a
+   * 308 redirect storm where each iteration grows the path.
+   *
    * Composition (outermost → innermost):
    *
    *   stripFilesPrefix          // path: /files/g/a/v/rest → /g/a/v/rest
    *   GavCacheMiddleware.notModified  // 304 short-circuit on /g/a/v/rest
    *   GavCacheMiddleware.cacheHeaders // stable ETag + LM on /g/a/v/rest
    *   restoreFilesPrefix        // path: /g/a/v/rest → /files/g/a/v/rest
-   *   routes
+   *   filesRoutes
    *
    * The 304 path's `ETag` is derived from the stripped path (`/g/a/v/rest`).
    * Stability across dyno cycles is what matters for CDN revalidation;
@@ -47,19 +53,23 @@ object App extends ZIOAppDefault:
    * any conditional GET to an immutable GAV path regardless of validator
    * value, so this is sound.
    */
+  private val FilesPrefix: Path = Path.root / "files"
+
   val stripFilesPrefix: HandlerAspect[Any, Unit] =
     HandlerAspect.interceptIncomingHandler:
       Handler.fromFunctionZIO[Request]: request =>
-        val segs = request.path.segments
-        if segs.length >= 1 && segs(0) == "files" then
-          ZIO.succeed((request.updatePath(_.drop(1)), ()))
-        else
-          ZIO.succeed((request, ()))
+        // `unnest` drops the prefix Path's full size — i.e. both the leading
+        // slash and the `files` segment. A naive `drop(1)` would drop only
+        // the leading slash (zio-http treats slashes as positional segments
+        // for `drop`), leaving `files` in place; combined with the restore
+        // below, that produced `/files/files/...` paths and the redirect
+        // loop we saw in production.
+        ZIO.succeed((request.updatePath(_.unnest(FilesPrefix)), ()))
 
   val restoreFilesPrefix: HandlerAspect[Any, Unit] =
     HandlerAspect.interceptIncomingHandler:
       Handler.fromFunctionZIO[Request]: request =>
-        ZIO.succeed((request.updatePath(p => Path.root / "files" ++ p), ()))
+        ZIO.succeed((request.updatePath(p => FilesPrefix ++ p), ()))
 
   /**
    * Background fiber: log `JarCache` size + on-disk bytes once a minute.
@@ -253,18 +263,38 @@ object App extends ZIOAppDefault:
     val path = op ++ gav.toPath
     Response.redirect(req.url.path(path), true).toHandler
 
-  val routes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+  /**
+   * Routes whose paths start with `/files/...`. These are the ones that
+   * benefit from `GavCacheMiddleware`'s GAV-shaped 304 short-circuit and
+   * stable cache validators, and these are the ones the strip/restore
+   * brackets are tuned for.
+   */
+  val filesRoutes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
     Routes(
       Method.GET / "files" / groupArtifactVersionPathCodec / trailing -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Path, Request)](fileHandler),
       Method.OPTIONS / "files" / trailing -> fileOptionsHandler,
+      Method.GET / "files" / "robots.txt" -> Handler.text(robotsTxt),
+    )
+
+  /**
+   * Everything else — `/listfiles`, `/numfiles`, top-level `/robots.txt`,
+   * the catch-all CORS preflight. These intentionally do **not** go
+   * through the strip/restore brackets: the brackets unconditionally
+   * re-prepend `/files` on the way back in, which would mangle every
+   * non-`/files` path.
+   */
+  val otherRoutes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+    Routes(
       Method.GET / "listfiles" / artifactVersionPathCodec -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Request)](addGroupId),
       Method.GET / "listfiles" / groupArtifactVersionPathCodec -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Request)](listFilesHandler),
       Method.GET / "numfiles" / artifactVersionPathCodec -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Request)](addGroupId),
       Method.GET / "numfiles" / groupArtifactVersionPathCodec -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Request)](numFilesHandler),
       Method.GET / "robots.txt" -> Handler.text(robotsTxt),
-      Method.GET / "files" / "robots.txt" -> Handler.text(robotsTxt),
       Method.OPTIONS / trailing -> corsPreflightHandler,
     )
+
+  val routes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+    filesRoutes ++ otherRoutes
 
   val serverConfig =
     ZLayer.fromZIO:
@@ -279,21 +309,38 @@ object App extends ZIOAppDefault:
   val serverLayer: ZLayer[Any, Throwable, Server] =
     serverConfig >>> Server.live
 
+  /**
+   * `filesRoutes` wrapped in the strip → cache → restore bracket. Kept
+   * separate from `otherRoutes` so the bracket only applies to paths
+   * that actually start with `/files/`.
+   */
+  val cachedFilesRoutes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+    filesRoutes
+      @@ restoreFilesPrefix
+      @@ GavCacheMiddleware.cacheHeaders()
+      @@ GavCacheMiddleware.notModified()
+      @@ stripFilesPrefix
+
+  /**
+   * The full HTTP app as deployed: `/files`-prefixed routes go through
+   * `GavCacheMiddleware` (with the strip/restore bracket); everything
+   * else routes directly. CORS and request logging wrap the whole thing.
+   *
+   * Tests should exercise this rather than `routes` when they want to
+   * cover middleware behavior — the bug that produced the prod 308 loop
+   * was invisible to tests that called `routes.runZIO` directly.
+   */
+  val app: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+    (cachedFilesRoutes ++ otherRoutes)
+      @@ corsMiddleware
+      @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(
+        Header.UserAgent,
+        Header.IfNoneMatch,
+        Header.IfModifiedSince,
+      ))
+
   override val run =
-    val server = Server.serve(
-      routes
-        @@ restoreFilesPrefix
-        @@ GavCacheMiddleware.cacheHeaders()
-        @@ GavCacheMiddleware.notModified()
-        @@ stripFilesPrefix
-        @@ corsMiddleware
-        @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(
-          Header.UserAgent,
-          Header.IfNoneMatch,
-          Header.IfModifiedSince,
-        ))
-    )
-    (cacheStatsLogger.forkDaemon *> server).provide(
+    (cacheStatsLogger.forkDaemon *> Server.serve(app)).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
       MavenCentral.MavenCentralRepo.live,

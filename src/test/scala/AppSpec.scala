@@ -203,6 +203,94 @@ object AppSpec extends ZIOSpecDefault:
       },
     ),
 
+    // Exercise the full deployed pipeline (cache middleware, strip/restore
+    // brackets, CORS, request logging). Earlier regressions were invisible
+    // to the suites above because they call `App.routes.runZIO` directly,
+    // bypassing the middleware. Use `App.app` here.
+    suite("full pipeline (App.app)")(
+      test("/listfiles redirect (no groupId) is not rewritten by the /files bracket") {
+        val request = Request.get(URL.decode("/listfiles/jquery/3.2.1").toOption.get)
+        for
+          response <- App.app.runZIO(request)
+        yield
+          assertTrue(
+            response.status == Status.PermanentRedirect,
+            response.header(Header.Location).map(_.renderedValue).contains("/listfiles/org.webjars/jquery/3.2.1"),
+          )
+      },
+
+      test("/listfiles with explicit groupId routes to listFilesHandler, not fileHandler") {
+        // Regression: with the broken bracket, this matched the
+        // /files/<g>/<a>/<v>/<trailing> route after the middleware
+        // mistakenly prepended `/files`, producing a 308 to a duplicated
+        // `/files/org.webjars/org.webjars/jquery/3.2.1` path.
+        val request = Request.get(URL.decode("/listfiles/org.webjars/jquery/3.2.1").toOption.get)
+        for
+          response <- App.app.runZIO(request)
+          body <- response.body.asString
+        yield
+          assertTrue(
+            response.status == Status.Ok,
+            body.startsWith("["),
+            body.contains("jquery.js"),
+          )
+      },
+
+      test("/numfiles with explicit groupId routes to numFilesHandler") {
+        val request = Request.get(URL.decode("/numfiles/org.webjars/jquery/3.2.1").toOption.get)
+        for
+          response <- App.app.runZIO(request)
+          body <- response.body.asString
+        yield
+          assertTrue(response.status == Status.Ok, body.trim == "4")
+      },
+
+      test("/robots.txt at root is not rewritten") {
+        val request = Request.get(URL.decode("/robots.txt").toOption.get)
+        for
+          response <- App.app.runZIO(request)
+          body <- response.body.asString
+        yield
+          assertTrue(response.status == Status.Ok, body.contains("User-agent"))
+      },
+
+      test("conditional GET to /files/<g>/<a>/<v>/<file> short-circuits to 304") {
+        // First call to capture the ETag emitted by GavCacheMiddleware.cacheHeaders.
+        val path = "/files/org.webjars/jquery/3.2.1/jquery.js"
+        val request1 = Request.get(URL.decode(path).toOption.get)
+        for
+          response1 <- App.app.runZIO(request1)
+          etag <- ZIO.fromOption(response1.headers.get(Header.ETag)).orElseFail(new Exception("ETag missing on 200 response"))
+          request2 = Request.get(URL.decode(path).toOption.get).addHeaders(Headers(Header.Custom("If-None-Match", etag.renderedValue)))
+          response2 <- App.app.runZIO(request2)
+        yield
+          assertTrue(
+            response1.status == Status.Ok,
+            response2.status == Status.NotModified,
+            // Stable validators from cacheHeaders: ETag and Last-Modified
+            // are derived from the path / pinned to epoch, so they should
+            // appear on the 304 too.
+            response2.headers.get(Header.ETag).isDefined,
+            response2.headers.get(Header.LastModified).isDefined,
+          )
+      },
+
+      test("/files/<g>/<a>/<v>/<file> path is not duplicated by the bracket") {
+        // Direct check against the path-doubling bug: a successful 200
+        // should report a Cache-Control header from the GavCacheMiddleware
+        // (immutable, public, year-long max-age), confirming the request
+        // both reached fileHandler and traversed cacheHeaders cleanly.
+        val request = Request.get(URL.decode("/files/org.webjars/jquery/3.2.1/jquery.js").toOption.get)
+        for
+          response <- App.app.runZIO(request)
+        yield
+          assertTrue(
+            response.status == Status.Ok,
+            response.headers.get(Header.CacheControl).exists(_.renderedValue.contains("immutable")),
+          )
+      },
+    ),
+
     suite("fetchFileList")(
       test("returns list of files in webjar") {
         for
