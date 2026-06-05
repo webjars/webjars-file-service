@@ -182,13 +182,29 @@ object App extends ZIOAppDefault:
           headers = commonHeaders,
         )
     else
-      jarHandle(gav).flatMap: handle =>
-        handle.readEntry(fileDetails.file).orElseFail(new java.nio.file.NoSuchFileException(fileDetails.file))
-      .map: bytes =>
+      jarHandle(gav).map: handle =>
+        // Stream the entry's bytes directly into the HTTP response body.
+        // `JarHandle.streamEntry` opens a fresh `InputStream` against the
+        // cached `ZipFile`, reads in 64KB chunks, and closes the stream
+        // when the response body is fully sent (or interrupted). This
+        // avoids the per-request `byte[]` allocation of the previous
+        // `readEntry` + `Body.fromArray` path, which was pinning the
+        // Heroku dyno at >100% memory under load and contributed to
+        // OOM-driven dyno crashes.
+        //
+        // `findFile` already verified the entry exists via `hasEntry`,
+        // so the `JarEntryNotFound` channel here is a defensive guard
+        // against a TOCTOU between findFile and streamEntry — converted
+        // to `NoSuchFileException` for parity with `readEntry`'s prior
+        // behavior.
+        val entryStream: ZStream[Any, Throwable, Byte] =
+          handle
+            .streamEntry(fileDetails.file)
+            .mapError(_ => new java.nio.file.NoSuchFileException(fileDetails.file))
         Response(
           status  = Status.Ok,
           headers = commonHeaders,
-          body    = Body.fromArray(bytes),
+          body    = Body.fromStreamChunked(entryStream),
         )
 
   def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
