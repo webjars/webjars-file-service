@@ -212,12 +212,49 @@ object App extends ZIOAppDefault:
         coldIdleTtl   = Some(1.hour),
         sweepInterval = 1.minute,
       )  /**
-   * Look up the `JarHandle` for a webjar GAV. Maps the upstream
-   * `NotFoundError` to a `FileNotFoundException` for parity with the
-   * previous extracted-dir flow.
+   * Look up the `JarHandle` for a webjar GAV. Maps the cache's two
+   * typed error variants:
+   *
+   *   - `NotFoundError` — the artifact doesn't exist on Maven Central.
+   *     Surfaced as `FileNotFoundException` (for parity with the
+   *     previous extracted-dir flow); route handlers map this to 404.
+   *   - `UpstreamCorruptError` — Maven Central served bytes for the
+   *     artifact but they don't parse as a valid jar (e.g. the
+   *     real-world `webvr-polyfill-dpdb/1.0.7.jar` which is 16 KB of
+   *     null bytes). Surfaced as [[WebJarCorruptException]]; route
+   *     handlers map this to 422.
    */
-  private def jarHandle(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, FileNotFoundException, JarCache.JarHandle] =
-    ZIO.serviceWithZIO[JarCache](_.get(gav)).orElseFail(FileNotFoundException(s"WebJar not found: $gav"))
+  private def jarHandle(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, java.io.IOException, JarCache.JarHandle] =
+    ZIO.serviceWithZIO[JarCache](_.get(gav)).mapError:
+      case _: MavenCentral.NotFoundError =>
+        FileNotFoundException(s"WebJar not found: $gav")
+      case e: JarCache.UpstreamCorruptError =>
+        WebJarCorruptException(s"WebJar bytes are corrupt: ${e.gav} (size=${e.sizeBytes}B): ${e.reason}")
+
+  /**
+   * Marker exception for upstream-corrupt webjars. Defined here (not in
+   * `zio-mavencentral`) because the typed `UpstreamCorruptError` from
+   * the cache is what crosses the library boundary; the exception is
+   * how this app bridges that into the Throwable error channel that
+   * the rest of `App` uses.
+   */
+  final class WebJarCorruptException(message: String) extends java.io.IOException(message)
+
+  /**
+   * Map an error from a `/files`/`/listfiles`/`/numfiles` request flow
+   * to an HTTP response. [[WebJarCorruptException]] becomes 422 (the
+   * artifact exists but cannot be processed); every other failure
+   * shape collapses to 404 (the artifact / file isn't here).
+   */
+  private def errorResponse(t: Throwable): Response =
+    t match
+      case _: WebJarCorruptException =>
+        Response(
+          Status.UnprocessableEntity,
+          body = Body.fromString(t.getMessage),
+        )
+      case _ =>
+        Response.notFound(t.getMessage)
 
   def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, JarDetails] =
     jarHandle(gav).map: handle =>
@@ -340,7 +377,7 @@ object App extends ZIOAppDefault:
         ZIO.serviceWithZIO[JarCache](_.contains(gav)).flatMap: cached =>
           ZIO.logInfo(s"webjar_cache=${if cached then "HIT" else "MISS"} gav=$gav") *>
             findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
-              e => ZIO.succeed(Response.notFound(e.getMessage))
+              e => ZIO.succeed(errorResponse(e))
       else
         val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
         ZIO.succeed(Response.redirect(request.url.path(path), true))
@@ -359,7 +396,7 @@ object App extends ZIOAppDefault:
         Handler.fromStreamChunked(jsonStream)
           .map(_.contentType(MediaType.application.json))
     .catchAll:
-      e => Response.notFound(e.getMessage).toHandler
+      e => errorResponse(e).toHandler
 
   def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     // todo cache headers
@@ -368,7 +405,7 @@ object App extends ZIOAppDefault:
         .flatMap(_.contents.runCount)
         .map(num => Response.text(num.toString))
     .catchAll:
-      e => Response.notFound(e.getMessage).toHandler
+      e => errorResponse(e).toHandler
 
   val fileOptionsHandler: Handler[Any, Nothing, Request, Response] =
     Handler.fromFunction[Request] { _ =>

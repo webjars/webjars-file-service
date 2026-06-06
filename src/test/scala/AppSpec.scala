@@ -32,6 +32,25 @@ object AppSpec extends ZIOSpecDefault:
           assertTrue(response.status == Status.NotFound, response.headers.get("Cache-Control").isEmpty || !response.headers.get("Cache-Control").exists(_.contains("max-age")))
       },
 
+      test("returns 422 for an upstream-corrupt webjar") {
+        // `webvr-polyfill-dpdb/1.0.7.jar` on Maven Central is 16 KB of
+        // null bytes (a botched 2018 publish). The route should treat
+        // it as Unprocessable rather than letting `ZipException` escape
+        // as a defect → 500. This test depends on the upstream artifact
+        // staying corrupt; if it's ever republished correctly, swap the
+        // GAV for any other broken one (or replace with a fixture-based
+        // test that injects a corrupt downloader directly).
+        val request = Request.get(URL.decode("/listfiles/org.webjars.npm/webvr-polyfill-dpdb/1.0.7").toOption.get)
+        for
+          response <- App.routes.runZIO(request)
+          body     <- response.body.asString
+        yield
+          assertTrue(
+            response.status == Status.UnprocessableEntity,
+            body.contains("corrupt"),
+          )
+      },
+
       test("works with org.webjars.npm groupId") {
         val request = Request.get(URL.decode("/files/org.webjars.npm/highlightjs__cdn-assets/11.4.0/highlight.min.js").toOption.get)
         for
