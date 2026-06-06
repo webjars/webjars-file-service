@@ -173,15 +173,33 @@ object App extends ZIOAppDefault:
    * use random access into the jar — no extracted directory, no
    * streaming-time deletion races.
    *
-   * `warmIdleTtl` controls when the cache demotes an idle entry from
-   * Warm (open `ZipFile` resident in heap) to Cold (only the `.jar`
-   * on disk). Heap-per-warm-jar is dominated by the central directory
-   * (~1 MB on average for a webjars-shaped corpus); demoting after 30
-   * minutes of idleness reclaims that for the long-tail traffic while
-   * keeping hot webjars (jQuery, Bootstrap, openui5, etc.) warm with
-   * no per-request open cost. The on-disk file is retained for the
-   * life of the dyno; cold entries re-promote on next access without
-   * re-downloading.
+   * Sizing
+   * ------
+   * `warmIdleTtl` controls the heap working set. Heap-per-warm-jar is
+   * dominated by the central directory (~0.5 MB on average for a
+   * webjars-shaped corpus); demoting after 30 minutes of idleness
+   * reclaims that for the long-tail traffic while keeping hot webjars
+   * (jQuery, Bootstrap, openui5, etc.) warm with no per-request open
+   * cost.
+   *
+   * `coldIdleTtl` controls the on-disk working set. With `Some(...)`,
+   * the sweeper deletes a cached `.jar` once the GAV has been idle for
+   * that long; the next request for that GAV is a full miss and
+   * re-downloads from Maven Central. This bounds Heroku ephemeral
+   * disk usage and (more importantly) the OS page-cache pressure that
+   * was triggering memory-quota kills (status 255) on Standard-2X
+   * dynos when the on-disk corpus grew to 10+ GB.
+   *
+   * For the Standard-2X dyno (1 GB total RAM), an idle bound of 1 hour
+   * keeps total residence time at warmIdleTtl + coldIdleTtl = 1.5 h.
+   * At an empirical ~14 jars/min sustained ingest with ~5 MB/jar
+   * average, that's ~1250 jars × 5 MB ≈ 6 GB on disk in steady state —
+   * 2× safer than the ~12 GB at the time of the kill, but still
+   * leaves the page-cache room to manage.
+   *
+   * If/when the dyno is bumped to a larger tier (e.g., Performance-M
+   * with 2.5 GB) the `coldIdleTtl` can be raised significantly — or
+   * set to `None` again — to maximize hit rate.
    */
   val jarCacheLayer: ZLayer[Client, Nothing, JarCache] =
     ZLayer.scoped:
@@ -191,6 +209,7 @@ object App extends ZIOAppDefault:
         JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
         label         = "webjar",
         warmIdleTtl   = 30.minutes,
+        coldIdleTtl   = Some(1.hour),
         sweepInterval = 1.minute,
       )  /**
    * Look up the `JarHandle` for a webjar GAV. Maps the upstream
