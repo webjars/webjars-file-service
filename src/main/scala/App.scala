@@ -136,7 +136,7 @@ object App extends ZIOAppDefault:
    */
   val snapshotLogger: ZIO[JarCache, Nothing, Long] =
     ZIO.serviceWithZIO[JarCache]: cache =>
-      cache.size.zip(cache.totalBytes).flatMap: (jars, cacheBytes) =>
+      cache.size.zip(cache.totalBytes).zip(cache.warmCount).flatMap: (jars, cacheBytes, warm) =>
         ZIO.succeed:
           val heap          = memoryBean.getHeapMemoryUsage.nn
           val (oldUsed, oldMax) = oldGenPool match
@@ -158,6 +158,7 @@ object App extends ZIOAppDefault:
               s"direct_used_mb=${directUsed / 1024 / 1024} " +
               s"open_fds=$openFds " +
               s"cache_jars=$jars " +
+              s"cache_warm=$warm " +
               s"cache_mb=${cacheBytes / 1024 / 1024} " +
               s"in_flight_streams=$inFlight"
           )
@@ -168,9 +169,19 @@ object App extends ZIOAppDefault:
   /**
    * Cache of fully-downloaded webjars on disk plus open `ZipFile` handles.
    * Backed by `zio-mavencentral`'s [[JarCache]]: each entry owns one
-   * immutable `.jar` file and one `ZipFile` handle. Reads use random
-   * access into the jar — no extracted directory, no streaming-time
-   * deletion races.
+   * immutable `.jar` file and (when warm) one `ZipFile` handle. Reads
+   * use random access into the jar — no extracted directory, no
+   * streaming-time deletion races.
+   *
+   * `warmIdleTtl` controls when the cache demotes an idle entry from
+   * Warm (open `ZipFile` resident in heap) to Cold (only the `.jar`
+   * on disk). Heap-per-warm-jar is dominated by the central directory
+   * (~1 MB on average for a webjars-shaped corpus); demoting after 30
+   * minutes of idleness reclaims that for the long-tail traffic while
+   * keeping hot webjars (jQuery, Bootstrap, openui5, etc.) warm with
+   * no per-request open cost. The on-disk file is retained for the
+   * life of the dyno; cold entries re-promote on next access without
+   * re-downloading.
    */
   val jarCacheLayer: ZLayer[Client, Nothing, JarCache] =
     ZLayer.scoped:
@@ -178,7 +189,9 @@ object App extends ZIOAppDefault:
       JarCache.make(
         cacheDir,
         JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
-        label = "webjar",
+        label         = "webjar",
+        warmIdleTtl   = 30.minutes,
+        sweepInterval = 1.minute,
       )  /**
    * Look up the `JarHandle` for a webjar GAV. Maps the upstream
    * `NotFoundError` to a `FileNotFoundException` for parity with the
