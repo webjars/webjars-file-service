@@ -5,7 +5,10 @@ import zio.http.codec.PathCodec
 import zio.stream.ZStream
 
 import java.io.FileNotFoundException
+import java.lang.management.{BufferPoolMXBean, ManagementFactory, MemoryPoolMXBean}
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicLong
+import scala.jdk.CollectionConverters.*
 
 object App extends ZIOAppDefault:
 
@@ -72,16 +75,93 @@ object App extends ZIOAppDefault:
         ZIO.succeed((request.updatePath(p => FilesPrefix ++ p), ()))
 
   /**
-   * Background fiber: log `JarCache` size + on-disk bytes once a minute.
-   * Useful for spotting unbounded growth on Heroku's ephemeral disk.
-   * `JarCache` itself has no eviction, so the only natural reset is dyno
-   * restart — these stats let us see how close to that limit we are.
+   * Counter of HTTP responses currently streaming bytes from a cached jar.
+   * Incremented when `serveFile` opens a `streamEntry` and decremented when
+   * the response body's scope closes (success, error, or interrupt).
+   *
+   * Read by `snapshotLogger`. Used to disambiguate "JarCache is the source
+   * of retained heap" from "per-request streams are leaking on cancellation":
+   * if this number stays small/stationary while heap climbs, the cache is
+   * the leak; if it climbs without bound, individual requests are leaking
+   * resources (and the H27 client-interrupt logs are a likely cause).
    */
-  val cacheStatsLogger: ZIO[JarCache, Nothing, Long] =
+  private val inFlightStreams: AtomicLong = AtomicLong(0L)
+
+  /**
+   * JVM management beans, captured once at class init. `oldGenPool` and
+   * `directBufferPool` are looked up by name because the canonical pool
+   * names depend on the GC algorithm (G1 → "G1 Old Gen", Parallel → "PS
+   * Old Gen", Serial → "Tenured Gen") and on JDK version.
+   *
+   * `unixOsBean` is `Some` on Linux/macOS (Heroku is Linux). Open file
+   * descriptor count is the cheapest proxy for "how many `ZipFile`
+   * instances does the cache currently hold open"; one fd per cached jar
+   * is the model we want to validate.
+   */
+  private val memoryBean = ManagementFactory.getMemoryMXBean.nn
+
+  private val oldGenPool: Option[MemoryPoolMXBean] =
+    ManagementFactory.getMemoryPoolMXBeans.nn.asScala.toList
+      .find: p =>
+        val name = p.getName.nn
+        name.contains("Old") || name.contains("Tenured")
+
+  private val directBufferPool: Option[BufferPoolMXBean] =
+    ManagementFactory.getPlatformMXBeans(classOf[BufferPoolMXBean]).nn.asScala.toList
+      .find(_.getName.nn == "direct")
+
+  private val unixOsBean: Option[com.sun.management.UnixOperatingSystemMXBean] =
+    ManagementFactory.getOperatingSystemMXBean match
+      case b: com.sun.management.UnixOperatingSystemMXBean => Some(b)
+      case _                                               => None
+
+  /**
+   * Background fiber: emit a structured snapshot every 30s correlating
+   * heap/old-gen/direct/fd counts with the JarCache's own size and the
+   * in-flight stream count.
+   *
+   * Every value is on one log line so a single `grep memory_snapshot` over
+   * a long log window plots cleanly. The disambiguation we want from this
+   * log is:
+   *
+   *   - cache_jars climbs ↔ old_used_mb climbs        → cache is the leak
+   *   - cache_jars flat,    old_used_mb climbs        → per-request leak
+   *   - open_fds ≈ cache_jars + small constant        → confirms 1 ZipFile per cache entry
+   *   - in_flight_streams stays small/stationary      → no per-request stream leak
+   *   - direct_used_mb stays tiny                     → not an off-heap problem
+   *
+   * Sampled values are pre-GC for heap (the JVM's own ergonomics dictate
+   * when GC runs); the unified GC log enabled in `Procfile` provides
+   * post-GC heap for the same time series.
+   */
+  val snapshotLogger: ZIO[JarCache, Nothing, Long] =
     ZIO.serviceWithZIO[JarCache]: cache =>
-      cache.size.zip(cache.totalBytes).flatMap: (jars, bytes) =>
-        ZIO.logInfo(s"cache_stats jars=$jars total_mb=${bytes / 1024 / 1024}")
-    .repeat(Schedule.fixed(60.seconds))
+      cache.size.zip(cache.totalBytes).flatMap: (jars, cacheBytes) =>
+        ZIO.succeed:
+          val heap          = memoryBean.getHeapMemoryUsage.nn
+          val (oldUsed, oldMax) = oldGenPool match
+            case Some(p) =>
+              val u = p.getUsage.nn
+              (u.getUsed, u.getMax)
+            case None => (-1L, -1L)
+          val directUsed = directBufferPool.fold(0L)(_.getMemoryUsed)
+          val openFds    = unixOsBean.fold(-1L)(_.getOpenFileDescriptorCount)
+          val inFlight   = inFlightStreams.get()
+          (heap.getUsed, heap.getMax, oldUsed, oldMax, directUsed, openFds, inFlight)
+        .flatMap: (heapUsed, heapMax, oldUsed, oldMax, directUsed, openFds, inFlight) =>
+          ZIO.logInfo(
+            s"memory_snapshot " +
+              s"heap_used_mb=${heapUsed / 1024 / 1024} " +
+              s"heap_max_mb=${heapMax / 1024 / 1024} " +
+              s"old_used_mb=${oldUsed / 1024 / 1024} " +
+              s"old_max_mb=${oldMax / 1024 / 1024} " +
+              s"direct_used_mb=${directUsed / 1024 / 1024} " +
+              s"open_fds=$openFds " +
+              s"cache_jars=$jars " +
+              s"cache_mb=${cacheBytes / 1024 / 1024} " +
+              s"in_flight_streams=$inFlight"
+          )
+    .repeat(Schedule.fixed(30.seconds))
 
   case class JarDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], contents: ZStream[Any, Throwable, String])
 
@@ -197,10 +277,25 @@ object App extends ZIOAppDefault:
         // against a TOCTOU between findFile and streamEntry — converted
         // to `NoSuchFileException` for parity with `readEntry`'s prior
         // behavior.
+        //
+        // Wrapped in an `unwrapScoped` + `acquireRelease` bracket so the
+        // `inFlightStreams` gauge increments when the response consumer
+        // first pulls and decrements when the scope closes — successful
+        // completion, stream error, *and* client interrupt (H27) all run
+        // the release. The scope spans the whole inner stream's lifetime,
+        // not just one of its operands, which is why `unwrapScoped` is
+        // used instead of `acquireReleaseWith ++ entryStream` (concat
+        // closes the first scope before the second runs).
         val entryStream: ZStream[Any, Throwable, Byte] =
-          handle
-            .streamEntry(fileDetails.file)
-            .mapError(_ => new java.nio.file.NoSuchFileException(fileDetails.file))
+          ZStream.unwrapScoped[Any]:
+            ZIO.acquireRelease(
+              ZIO.succeed { inFlightStreams.incrementAndGet(); () }
+            )(_ => ZIO.succeed { inFlightStreams.decrementAndGet(); () })
+              .as(
+                handle
+                  .streamEntry(fileDetails.file)
+                  .mapError(_ => new java.nio.file.NoSuchFileException(fileDetails.file))
+              )
         Response(
           status  = Status.Ok,
           headers = commonHeaders,
@@ -356,7 +451,7 @@ object App extends ZIOAppDefault:
       ))
 
   override val run =
-    (cacheStatsLogger.forkDaemon *> Server.serve(app)).provide(
+    (snapshotLogger.forkDaemon *> Server.serve(app)).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
       MavenCentral.MavenCentralRepo.live,
