@@ -190,12 +190,21 @@ object App extends ZIOAppDefault:
    * was triggering memory-quota kills (status 255) on Standard-2X
    * dynos when the on-disk corpus grew to 10+ GB.
    *
-   * For the Standard-2X dyno (1 GB total RAM), an idle bound of 1 hour
-   * keeps total residence time at warmIdleTtl + coldIdleTtl = 1.5 h.
-   * At an empirical ~14 jars/min sustained ingest with ~5 MB/jar
-   * average, that's ~1250 jars × 5 MB ≈ 6 GB on disk in steady state —
-   * 2× safer than the ~12 GB at the time of the kill, but still
-   * leaves the page-cache room to manage.
+   * For the Standard-2X dyno (1 GB total RAM), the previous setting
+   * (`coldIdleTtl = 1.hour`) was sized for ~14 jars/min × 5 MB/jar →
+   * ~1250 jars × 5 MB ≈ 6 GB on disk. Production telemetry from
+   * `snapshotLogger` (cache_jars ~1700, cache_mb ~9900, R14 firing
+   * every 15–30s) showed actual traffic at ~19 jars/min and
+   * ~5.84 MB/jar — ~1.6× the design size, with the on-disk corpus
+   * pushing the OS page cache past the dyno's RAM quota.
+   *
+   * Tightened to `45.minutes` so total residence is
+   * warmIdleTtl + coldIdleTtl = 75 min. At the measured 19 jars/min ×
+   * 5.84 MB that projects to ~1425 jars × 5.84 MB ≈ 8.3 GB steady
+   * state — still above the original 6 GB target but ~17% below the
+   * level that was firing R14. Watch `cache_mb` and the R14 cadence
+   * after deploy: if R14 still fires steadily, drop `coldIdleTtl`
+   * further (30m → ~5.5 GB projected) before bumping the dyno tier.
    *
    * If/when the dyno is bumped to a larger tier (e.g., Performance-M
    * with 2.5 GB) the `coldIdleTtl` can be raised significantly — or
@@ -209,7 +218,7 @@ object App extends ZIOAppDefault:
         JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
         label         = "webjar",
         warmIdleTtl   = 30.minutes,
-        coldIdleTtl   = Some(1.hour),
+        coldIdleTtl   = Some(45.minutes),
         sweepInterval = 1.minute,
       )  /**
    * Look up the `JarHandle` for a webjar GAV. Maps the cache's two
