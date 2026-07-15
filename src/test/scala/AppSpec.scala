@@ -383,6 +383,21 @@ object AppSpec extends ZIOSpecDefault:
         yield
           assertTrue(response.status == Status.Ok, decompressedBody.contains("jQuery"))
       },
+      // Regression test for
+      // https://www.webjars.org/listfiles/org.webjars/jquery-ui/1.14.2%2B1
+      // returning 404. Uses a real socket (unlike the `listfiles endpoint`
+      // suite above, which builds `Request`s via `URL.decode` client-side
+      // and so never exercises the raw `%2B`-on-the-wire request line a
+      // browser actually sends).
+      test("listfiles resolves a version containing a %2B-encoded plus sign over real HTTP") {
+        for
+          port <- Server.install(App.routes @@ App.corsMiddleware)
+          url <- ZIO.fromEither(URL.decode(s"http://localhost:$port/listfiles/org.webjars/jquery-ui/1.14.2%2B1"))
+          response <- ZClient.batched(Request.get(url))
+          body <- response.body.asString
+        yield
+          assertTrue(response.status == Status.Ok, body.startsWith("["))
+      },
     ).provide(Client.default, App.serverLayer, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
 
   ).provide(Client.default, Scope.default, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live)
