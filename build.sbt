@@ -16,3 +16,10 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test"     % "2.1.26" % Test,
   "dev.zio" %% "zio-test-sbt" % "2.1.26" % Test,
 )
+
+// This is a deployed service, not a published library, so we don't need
+// Scaladoc. Disabling it stops the `doc` task from processing sources —
+// which is where the unresolved `[[JarCache]]` doclink warning came from
+// (the `compile` task never emitted it) — and skips packaging a doc jar.
+Compile / doc / sources := Seq.empty
+Compile / packageDoc / publishArtifact := false
