@@ -175,12 +175,37 @@ object App extends ZIOAppDefault:
    *
    * Sizing
    * ------
-   * `warmIdleTtl` controls the heap working set. Heap-per-warm-jar is
-   * dominated by the central directory (~0.5 MB on average for a
-   * webjars-shaped corpus); demoting after 30 minutes of idleness
-   * reclaims that for the long-tail traffic while keeping hot webjars
-   * (jQuery, Bootstrap, openui5, etc.) warm with no per-request open
-   * cost.
+   * `warmIdleTtl` controls the heap working set, and under our
+   * crawler-driven long-tail load it is effectively what sets peak
+   * heap. Because almost every requested GAV is fetched roughly once
+   * and then goes idle, the warm set converges to
+   * `unique_arrival_rate × warmIdleTtl`; genuinely hot webjars
+   * (jQuery, Bootstrap, openui5, etc.) reset their idle timer on every
+   * hit and stay warm regardless, so a short TTL sheds only the
+   * one-shot long tail.
+   *
+   * Sized from the 2026-08-02 OOM incident telemetry: on the
+   * Standard-2X dyno `heap_max_mb = 672`, heap-per-warm-jar ≈ 0.45 MB
+   * (dominated by the ZipFile central directory), and the flood drove
+   * ~27 unique jars/s. The previous `30.minutes` let the warm set grow
+   * unbounded — `snapshotLogger` showed cache_jars 0 → 2995 and
+   * heap_used 17 → 607 MB in ~2 min, ending in
+   * `java.lang.OutOfMemoryError: Java heap space` (exit 255) in a tight
+   * crash loop. Targeting ~40–50 % of heap (~650–750 warm jars) gives
+   * `warmIdleTtl ≈ 700 / 27 ≈ 30 s`, so it is set to `30.seconds`.
+   *
+   * `sweepInterval` must be well under `warmIdleTtl` or demotion can't
+   * keep up: at ~27 jars/s a `1.minute` sweep let ~1600 jars accumulate
+   * between runs and OOM before the sweeper fired. Set to `15.seconds`,
+   * bounding the worst case to ~27/s × ~45 s ≈ ~1200 jars ≈ ~540 MB.
+   * Watch `heap_used_mb` after deploy; if it still approaches 672, drop
+   * `warmIdleTtl` toward 20 s.
+   *
+   * Note this is inherently rate-dependent (warm_jars = rate × ttl), so
+   * a larger traffic burst can re-break it. The durable fixes are a
+   * bigger dyno/heap or a hard warm-count cap (bounded LRU) in
+   * `zio-mavencentral`'s `JarCache`; this TTL setting is the
+   * survive-the-flood measure on the current tier.
    *
    * `coldIdleTtl` controls the on-disk working set. With `Some(...)`,
    * the sweeper deletes a cached `.jar` once the GAV has been idle for
@@ -198,13 +223,9 @@ object App extends ZIOAppDefault:
    * ~5.84 MB/jar — ~1.6× the design size, with the on-disk corpus
    * pushing the OS page cache past the dyno's RAM quota.
    *
-   * Tightened to `45.minutes` so total residence is
-   * warmIdleTtl + coldIdleTtl = 75 min. At the measured 19 jars/min ×
-   * 5.84 MB that projects to ~1425 jars × 5.84 MB ≈ 8.3 GB steady
-   * state — still above the original 6 GB target but ~17% below the
-   * level that was firing R14. Watch `cache_mb` and the R14 cadence
-   * after deploy: if R14 still fires steadily, drop `coldIdleTtl`
-   * further (30m → ~5.5 GB projected) before bumping the dyno tier.
+   * Kept at `45.minutes`. Watch `cache_mb` and the R14 cadence after
+   * deploy: if R14 still fires steadily, drop `coldIdleTtl` further
+   * (30m → ~5.5 GB projected) before bumping the dyno tier.
    *
    * If/when the dyno is bumped to a larger tier (e.g., Performance-M
    * with 2.5 GB) the `coldIdleTtl` can be raised significantly — or
@@ -217,9 +238,9 @@ object App extends ZIOAppDefault:
         cacheDir,
         JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
         label         = "webjar",
-        warmIdleTtl   = 30.minutes,
+        warmIdleTtl   = 30.seconds,
         coldIdleTtl   = Some(45.minutes),
-        sweepInterval = 1.minute,
+        sweepInterval = 15.seconds,
       )  /**
    * Look up the `JarHandle` for a webjar GAV. Maps the cache's two
    * typed error variants:
@@ -532,6 +553,21 @@ object App extends ZIOAppDefault:
     (snapshotLogger.forkDaemon *> Server.serve(app)).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
-      MavenCentral.MavenCentralRepo.live,
+      // Google's GCS mirror is the default backend, with Maven Central
+      // (repo1 + the Apache alias) as fallback. Rationale: under our
+      // crawler-driven long-tail load, repo1.maven.org throttles the app
+      // with 403/429s, which trips the per-mirror circuit breaker and
+      // sidelines it for `resetMin`. GCS tolerates the request volume
+      // better, so leading with it keeps the fast path open; repo1 is
+      // still there to catch anything GCS is missing. Mirror choice does
+      // not affect the heap-OOM crash — that's the JarCache retention
+      // issue, tracked separately.
+      MavenCentral.MavenCentralRepo.custom(
+        mirrors = List(
+          MavenCentral.gcsMirror,
+          MavenCentral.primaryUri,
+          MavenCentral.apacheAlias,
+        )
+      ),
       jarCacheLayer,
     )
