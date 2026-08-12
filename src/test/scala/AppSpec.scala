@@ -400,4 +400,9 @@ object AppSpec extends ZIOSpecDefault:
       },
     ).provide(Client.default, App.serverLayer, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
 
-  ).provide(Client.default, Scope.default, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live)
+  ).provide(Client.default, Scope.default, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live) @@ TestAspect.timeout(60.seconds)
+  // Per-test wall-clock timeout. Every test here hits live Maven Central, so a
+  // throttled/stalled upstream request (common from CI runner IPs) would
+  // otherwise block a fiber forever and hang the whole `sbt test` run with no
+  // failure — as happened on the zio-mavencentral 0.13.x bump. Bounding each
+  // test turns that into a fast, legible failure instead of an infinite hang.
