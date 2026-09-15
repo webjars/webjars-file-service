@@ -532,6 +532,35 @@ object App extends ZIOAppDefault:
       @@ stripFilesPrefix
 
   /**
+   * Request headers included as structured log annotations.
+   *
+   * jsDelivr replaces `User-Agent` on origin fetches with its own
+   * `jsdelivr-origin/...` value, and does not publicly document a header that
+   * always carries the end-user UA. Keep that origin-facing value for
+   * diagnostics, but also capture common proxy conventions when an upstream
+   * chooses to provide them. Likewise, log the standard `Referer` and `Origin`
+   * headers plus their common forwarded/original variants. Missing headers
+   * simply produce no annotation, so we never manufacture client metadata.
+   */
+  private def customHeaderType(name: String): Header.HeaderTypeBase =
+    Header.Custom(name, "").headerType
+
+  val loggedRequestHeaders: Set[Header.HeaderTypeBase] = Set(
+    Header.UserAgent,
+    customHeaderType("X-Forwarded-User-Agent"),
+    customHeaderType("X-Original-User-Agent"),
+    Header.Referer,
+    Header.Origin,
+    customHeaderType("X-Forwarded-Referer"),
+    customHeaderType("X-Original-Referer"),
+    Header.IfNoneMatch,
+    Header.IfModifiedSince,
+  )
+
+  val requestLogging: HandlerAspect[Any, Unit] =
+    HandlerAspect.requestLogging(loggedRequestHeaders = loggedRequestHeaders)
+
+  /**
    * The full HTTP app as deployed: `/files`-prefixed routes go through
    * `GavCacheMiddleware` (with the strip/restore bracket); everything
    * else routes directly. CORS and request logging wrap the whole thing.
@@ -543,11 +572,7 @@ object App extends ZIOAppDefault:
   val app: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
     (cachedFilesRoutes ++ otherRoutes)
       @@ corsMiddleware
-      @@ HandlerAspect.requestLogging(loggedRequestHeaders = Set(
-        Header.UserAgent,
-        Header.IfNoneMatch,
-        Header.IfModifiedSince,
-      ))
+      @@ requestLogging
 
   override val run =
     (snapshotLogger.forkDaemon *> Server.serve(app)).provide(

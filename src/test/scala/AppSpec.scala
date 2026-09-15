@@ -222,6 +222,49 @@ object AppSpec extends ZIOSpecDefault:
       },
     ),
 
+    suite("request logging")(
+      test("captures standard and forwarded client metadata when present") {
+        val request = Request
+          .get(URL.decode("/logging-test").toOption.get)
+          .addHeaders(
+            Headers(
+              Header.UserAgent.parse("jsdelivr-origin/2.6.1").toOption.get,
+              Header.Referer(URL.decode("https://example.com/assets").toOption.get),
+              Header.Origin("https", "example.com"),
+              Header.Custom("x-forwarded-user-agent", "Mozilla/5.0 forwarded"),
+              Header.Custom("x-original-user-agent", "Mozilla/5.0 original"),
+              Header.Custom("x-forwarded-referer", "https://forwarded.example/page"),
+              Header.Custom("x-original-referer", "https://original.example/page"),
+            )
+          )
+        val loggingApp = Routes(Method.GET / "logging-test" -> Handler.ok) @@ App.requestLogging
+
+        for
+          _      <- loggingApp.runZIO(request)
+          output <- ZTestLogger.logOutput
+          annotations <- ZIO
+            .fromOption(
+              output
+                .find(entry =>
+                  entry.message() == "Http request served" &&
+                    entry.annotations.get("url").contains("/logging-test")
+                )
+                .map(_.annotations)
+            )
+            .orElseFail(new Exception("request log entry missing"))
+        yield
+          assertTrue(
+            annotations.get("user-agent").contains("jsdelivr-origin/2.6.1"),
+            annotations.get("referer").contains("https://example.com/assets"),
+            annotations.get("origin").contains("https://example.com"),
+            annotations.get("x-forwarded-user-agent").contains("Mozilla/5.0 forwarded"),
+            annotations.get("x-original-user-agent").contains("Mozilla/5.0 original"),
+            annotations.get("x-forwarded-referer").contains("https://forwarded.example/page"),
+            annotations.get("x-original-referer").contains("https://original.example/page"),
+          )
+      },
+    ),
+
     // Exercise the full deployed pipeline (cache middleware, strip/restore
     // brackets, CORS, request logging). Earlier regressions were invisible
     // to the suites above because they call `App.routes.runZIO` directly,
