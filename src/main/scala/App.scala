@@ -230,9 +230,12 @@ object App extends ZIOAppDefault:
    * ~5.84 MB/jar — ~1.6× the design size, with the on-disk corpus
    * pushing the OS page cache past the dyno's RAM quota.
    *
-   * Kept at `45.minutes`. Watch `cache_mb` and the R14 cadence after
-   * deploy: if R14 still fires steadily, drop `coldIdleTtl` further
-   * (30m → ~5.5 GB projected) before bumping the dyno tier.
+   * Was `45.minutes`; dropped to `10.minutes` during the 2026-10 jsDelivr
+   * crawl flood, when cache_jars ~9700 inside the 45-minute window
+   * (~215 new GAVs/min) and cache_mb ~14700 had the dyno pinned at ~170 % of
+   * its memory quota (R14 every ~20 s). Repeat hits for a crawled file are
+   * absorbed by jsDelivr (immutable, 1 year), so a short cold TTL costs
+   * little hit rate. Watch `cache_mb` and the R14 cadence.
    *
    * If/when the dyno is bumped to a larger tier (e.g., Performance-M
    * with 2.5 GB) the `coldIdleTtl` can be raised significantly — or
@@ -246,7 +249,7 @@ object App extends ZIOAppDefault:
         JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
         label         = "webjar",
         warmIdleTtl   = 30.seconds,
-        coldIdleTtl   = Some(45.minutes),
+        coldIdleTtl   = Some(10.minutes),
         sweepInterval = 15.seconds,
       )  /**
    * Look up the `JarHandle` for a webjar GAV. Maps the cache's two

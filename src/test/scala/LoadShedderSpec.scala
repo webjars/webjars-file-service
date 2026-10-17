@@ -53,34 +53,37 @@ object LoadShedderSpec extends ZIOSpecDefault:
       test("below softLimit everything is admitted"):
         val c = LoadShedder.defaultConfig
         assertTrue(
-          LoadShedder.decide(c, c.softLimit - 1, LoadShedder.Priority.Low(LoadShedder.ShedReason.SweptGav)) == LoadShedder.Decision.Admit,
+          LoadShedder.decide(c, c.softLimit - 1, LoadShedder.Priority.Low(LoadShedder.ShedReason.SweptGav), cached = false) == LoadShedder.Decision.Admit,
         )
       ,
-      test("between soft and hard limits only low priority is shed"):
+      test("between soft and hard limits only low-priority cache misses are shed"):
         val c = LoadShedder.defaultConfig
+        val low = LoadShedder.Priority.Low(LoadShedder.ShedReason.NonRuntimePath)
         assertTrue(
-          LoadShedder.decide(c, c.softLimit, LoadShedder.Priority.High) == LoadShedder.Decision.Admit,
-          LoadShedder.decide(c, c.softLimit, LoadShedder.Priority.Low(LoadShedder.ShedReason.NonRuntimePath)) ==
-            LoadShedder.Decision.Shed(LoadShedder.ShedReason.NonRuntimePath),
+          LoadShedder.decide(c, c.softLimit, LoadShedder.Priority.High, cached = false) == LoadShedder.Decision.Admit,
+          LoadShedder.decide(c, c.softLimit, low, cached = false) == LoadShedder.Decision.Shed(LoadShedder.ShedReason.NonRuntimePath),
+          LoadShedder.decide(c, c.softLimit, low, cached = true) == LoadShedder.Decision.Admit,
         )
       ,
-      test("at hardLimit everything is shed"):
+      test("at hardLimit everything is shed, cached or not"):
         val c = LoadShedder.defaultConfig
         assertTrue(
-          LoadShedder.decide(c, c.hardLimit, LoadShedder.Priority.High) == LoadShedder.Decision.Shed(LoadShedder.ShedReason.Overloaded),
+          LoadShedder.decide(c, c.hardLimit, LoadShedder.Priority.High, cached = true) == LoadShedder.Decision.Shed(LoadShedder.ShedReason.Overloaded),
         )
       ,
     ),
     suite("guard")(
-      test("under overload, sheds non-runtime paths with 503 + Retry-After but serves runtime assets"):
+      test("under overload, sheds non-runtime cache misses with 503 + Retry-After but serves runtime assets and cache hits"):
         for
-          s       <- shedder(relaxed.copy(softLimit = 0))
-          asset   <- s.guard(gav, path("/demo.js"), cached = true)(ok)
-          sourceMap <- s.guard(gav, path("/demo.js.map"), cached = true)(ok)
-          c       <- counts(s)
+          s         <- shedder(relaxed.copy(softLimit = 0))
+          asset     <- s.guard(gav, path("/demo.js"), cached = false)(ok)
+          sourceMap <- s.guard(gav, path("/demo.js.map"), cached = false)(ok)
+          cachedMap <- s.guard(gav, path("/demo.js.map"), cached = true)(ok)
+          c         <- counts(s)
         yield assertTrue(
           asset.status == Status.Ok,
           sourceMap.status == Status.ServiceUnavailable,
+          cachedMap.status == Status.Ok,
           sourceMap.rawHeader("Retry-After").contains("120"),
           c.get(LoadShedder.ShedReason.NonRuntimePath).contains(1L),
         )
@@ -88,20 +91,22 @@ object LoadShedderSpec extends ZIOSpecDefault:
       test("not overloaded: non-runtime paths are served"):
         for
           s <- shedder(relaxed)
-          r <- s.guard(gav, path("/demo.js.map"), cached = true)(ok)
+          r <- s.guard(gav, path("/demo.js.map"), cached = false)(ok)
         yield assertTrue(r.status == Status.Ok)
       ,
-      test("a GAV swept past sweepLimit distinct files is shed under overload, and resets after the window"):
+      test("a GAV swept past sweepLimit distinct files has its misses shed under overload, and resets after the window"):
         for
           s      <- shedder(relaxed.copy(softLimit = 0, sweepLimit = 2, sweepWindow = 1.minute))
-          first  <- ZIO.foreach(List("/a.js", "/b.js", "/a.js"))(p => s.guard(gav, path(p), cached = true)(ok))
-          third  <- s.guard(gav, path("/c.js"), cached = true)(ok)
+          first  <- ZIO.foreach(List("/a.js", "/b.js", "/a.js"))(p => s.guard(gav, path(p), cached = false)(ok))
+          third  <- s.guard(gav, path("/c.js"), cached = false)(ok)
+          hit    <- s.guard(gav, path("/e.js"), cached = true)(ok)
           swept  <- s.snapshot.map(_.sweptGavs)
           _      <- TestClock.adjust(2.minutes)
-          after  <- s.guard(gav, path("/d.js"), cached = true)(ok)
+          after  <- s.guard(gav, path("/d.js"), cached = false)(ok)
         yield assertTrue(
           first.forall(_.status == Status.Ok), // repeats of /a.js don't count as new files
           third.status == Status.ServiceUnavailable,
+          hit.status == Status.Ok,
           swept == 1,
           after.status == Status.Ok,
         )

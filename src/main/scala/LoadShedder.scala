@@ -16,10 +16,18 @@ import java.util.Locale
  * first fetches, not repeat page loads.
  *
  * Ranking, while load is between `softLimit` and `hardLimit`:
- *   - runtime assets (js/css/fonts/images) for a GAV that isn't being swept: served
- *   - non-runtime paths (source maps, TS sources, tests, docs, ...): shed
- *   - any path of a GAV with more than `sweepLimit` distinct files requested
- *     inside `sweepWindow` (a real page needs a handful per webjar): shed
+ *   - anything whose jar is already cached: served. Serving a cached entry
+ *     costs about as much as rejecting it, and jsDelivr retries a 503 within
+ *     seconds (ignoring `Retry-After`) 3-4 times, so shedding cheap requests
+ *     multiplied load instead of reducing it. A 200 is cached by jsDelivr for
+ *     a year and ends the retries.
+ *   - cache misses (a full jar download) for runtime assets of a GAV that
+ *     isn't being swept: served
+ *   - cache misses for non-runtime paths (source maps, TS sources, tests,
+ *     docs, ...): shed
+ *   - cache misses for a GAV with more than `sweepLimit` distinct files
+ *     requested inside `sweepWindow` (a real page needs a handful per
+ *     webjar): shed
  * At `hardLimit` everything new is shed, as a safety valve.
  *
  * Cache misses (a full jar download, the expensive path) are additionally
@@ -43,7 +51,7 @@ final case class LoadShedder(
         swept    <- recordAndCheckSwept(gav, file.encode)
         load     <- active.get.zipWith(streamsInFlight)(_ + _)
         priority  = LoadShedder.priority(file.encode, swept)
-        response <- decide(config, load, priority) match
+        response <- decide(config, load, priority, cached) match
           case Decision.Shed(reason) => shed(reason)
           case Decision.Admit        => if cached then work else gateDownload(priority)(work)
       yield response
@@ -160,11 +168,11 @@ object LoadShedder:
     else if isNonRuntimePath(path) then Priority.Low(ShedReason.NonRuntimePath)
     else Priority.High
 
-  def decide(config: Config, load: Long, priority: Priority): Decision =
+  def decide(config: Config, load: Long, priority: Priority, cached: Boolean): Decision =
     priority match
-      case _ if load >= config.hardLimit                => Decision.Shed(ShedReason.Overloaded)
-      case Priority.Low(reason) if load >= config.softLimit => Decision.Shed(reason)
-      case _                                            => Decision.Admit
+      case _ if load >= config.hardLimit                                => Decision.Shed(ShedReason.Overloaded)
+      case Priority.Low(reason) if !cached && load >= config.softLimit => Decision.Shed(reason)
+      case _                                                            => Decision.Admit
 
   def shedResponse(config: Config, reason: ShedReason): Response =
     Response(
