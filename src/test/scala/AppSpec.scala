@@ -441,9 +441,9 @@ object AppSpec extends ZIOSpecDefault:
         yield
           assertTrue(response.status == Status.Ok, body.startsWith("["))
       },
-    ).provide(Client.default, App.serverLayer, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
+    ).provide(Client.default, App.serverLayer, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live, App.loadShedderLayer) @@ TestAspect.sequential, // todo: random server port and shared server (can't do that because Server.install duplicates routes)
 
-  ).provide(Client.default, Scope.default, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live) @@ TestAspect.timeout(60.seconds)
+  ).provide(Client.default, Scope.default, App.jarCacheLayer, MavenCentral.MavenCentralRepo.live, App.loadShedderLayer) @@ TestAspect.timeout(60.seconds)
   // Per-test wall-clock timeout. Every test here hits live Maven Central, so a
   // throttled/stalled upstream request (common from CI runner IPs) would
   // otherwise block a fiber forever and hang the whole `sbt test` run with no

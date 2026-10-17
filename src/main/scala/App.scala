@@ -18,6 +18,8 @@ object App extends ZIOAppDefault:
 
   val webJarsPathPrefix = "META-INF/resources/webjars"
 
+  type FilesEnv = Client & JarCache & MavenCentral.MavenCentralRepo & LoadShedder
+
   // todo: use CORS Middleware from ZIO HTTP: https://ziohttp.com/reference/aop/middleware#access-control-allow-origin-cors-middleware
   // CORS middleware that adds Access-Control-Allow-Origin: * to all responses
   val corsMiddleware: HandlerAspect[Any, Unit] =
@@ -87,6 +89,9 @@ object App extends ZIOAppDefault:
    */
   private val inFlightStreams: AtomicLong = AtomicLong(0L)
 
+  val loadShedderLayer: ZLayer[Any, Nothing, LoadShedder] =
+    LoadShedder.layer(LoadShedder.defaultConfig, ZIO.succeed(inFlightStreams.get()))
+
   /**
    * JVM management beans, captured once at class init. `oldGenPool` and
    * `directBufferPool` are looked up by name because the canonical pool
@@ -134,7 +139,7 @@ object App extends ZIOAppDefault:
    * when GC runs); the unified GC log enabled in `Procfile` provides
    * post-GC heap for the same time series.
    */
-  val snapshotLogger: ZIO[JarCache, Nothing, Long] =
+  val snapshotLogger: ZIO[JarCache & LoadShedder, Nothing, Long] =
     ZIO.serviceWithZIO[JarCache]: cache =>
       cache.size.zip(cache.totalBytes).zip(cache.warmCount).flatMap: (jars, cacheBytes, warm) =>
         ZIO.succeed:
@@ -149,19 +154,21 @@ object App extends ZIOAppDefault:
           val inFlight   = inFlightStreams.get()
           (heap.getUsed, heap.getMax, oldUsed, oldMax, directUsed, openFds, inFlight)
         .flatMap: (heapUsed, heapMax, oldUsed, oldMax, directUsed, openFds, inFlight) =>
-          ZIO.logInfo(
-            s"memory_snapshot " +
-              s"heap_used_mb=${heapUsed / 1024 / 1024} " +
-              s"heap_max_mb=${heapMax / 1024 / 1024} " +
-              s"old_used_mb=${oldUsed / 1024 / 1024} " +
-              s"old_max_mb=${oldMax / 1024 / 1024} " +
-              s"direct_used_mb=${directUsed / 1024 / 1024} " +
-              s"open_fds=$openFds " +
-              s"cache_jars=$jars " +
-              s"cache_warm=$warm " +
-              s"cache_mb=${cacheBytes / 1024 / 1024} " +
-              s"in_flight_streams=$inFlight"
-          )
+          ZIO.serviceWithZIO[LoadShedder](_.snapshot.flatMap(_.render)).flatMap: shedding =>
+            ZIO.logInfo(
+              s"memory_snapshot " +
+                s"heap_used_mb=${heapUsed / 1024 / 1024} " +
+                s"heap_max_mb=${heapMax / 1024 / 1024} " +
+                s"old_used_mb=${oldUsed / 1024 / 1024} " +
+                s"old_max_mb=${oldMax / 1024 / 1024} " +
+                s"direct_used_mb=${directUsed / 1024 / 1024} " +
+                s"open_fds=$openFds " +
+                s"cache_jars=$jars " +
+                s"cache_warm=$warm " +
+                s"cache_mb=${cacheBytes / 1024 / 1024} " +
+                s"in_flight_streams=$inFlight " +
+                shedding
+            )
     .repeat(Schedule.fixed(30.seconds))
 
   case class JarDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], contents: ZStream[Any, Throwable, String])
@@ -401,13 +408,15 @@ object App extends ZIOAppDefault:
           body    = Body.fromStreamChunked(entryStream),
         )
 
-  def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
+  def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[FilesEnv, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
     Handler.fromZIO:
       if gav.groupId.toString.startsWith("org.webjars") then
         ZIO.serviceWithZIO[JarCache](_.contains(gav)).flatMap: cached =>
           ZIO.logInfo(s"webjar_cache=${if cached then "HIT" else "MISS"} gav=$gav") *>
-            findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
-              e => ZIO.succeed(errorResponse(e))
+            ZIO.serviceWithZIO[LoadShedder](_.guard(gav, file, cached):
+              findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
+                e => ZIO.succeed(errorResponse(e))
+            )
       else
         val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
         ZIO.succeed(Response.redirect(request.url.path(path), true))
@@ -479,7 +488,7 @@ object App extends ZIOAppDefault:
    * stable cache validators, and these are the ones the strip/restore
    * brackets are tuned for.
    */
-  val filesRoutes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+  val filesRoutes: Routes[FilesEnv, Response] =
     Routes(
       Method.GET / "files" / groupArtifactVersionPathCodec / trailing -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Path, Request)](fileHandler),
       Method.OPTIONS / "files" / trailing -> fileOptionsHandler,
@@ -503,7 +512,7 @@ object App extends ZIOAppDefault:
       Method.OPTIONS / trailing -> corsPreflightHandler,
     )
 
-  val routes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+  val routes: Routes[FilesEnv, Response] =
     filesRoutes ++ otherRoutes
 
   val serverConfig =
@@ -524,7 +533,7 @@ object App extends ZIOAppDefault:
    * separate from `otherRoutes` so the bracket only applies to paths
    * that actually start with `/files/`.
    */
-  val cachedFilesRoutes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+  val cachedFilesRoutes: Routes[FilesEnv, Response] =
     filesRoutes
       @@ restoreFilesPrefix
       @@ GavCacheMiddleware.cacheHeaders()
@@ -569,7 +578,7 @@ object App extends ZIOAppDefault:
    * cover middleware behavior — the bug that produced the prod 308 loop
    * was invisible to tests that called `routes.runZIO` directly.
    */
-  val app: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+  val app: Routes[FilesEnv, Response] =
     (cachedFilesRoutes ++ otherRoutes)
       @@ corsMiddleware
       @@ requestLogging
@@ -595,4 +604,5 @@ object App extends ZIOAppDefault:
         )
       ),
       jarCacheLayer,
+      loadShedderLayer,
     )
