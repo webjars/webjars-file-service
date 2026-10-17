@@ -30,9 +30,14 @@ object WebJarStoreSpec extends ZIOSpecDefault:
         stored      <- store.known(gav).some
         storedBytes <- stored.stream(jqueryJs).runCollect
         storedNames <- stored.fileNames
+        // The staged jar is retired once stored; a source obtained before that
+        // keeps working by reading from the object store.
+        _           <- store.stagedCount.repeat(Schedule.recurUntil[Int](_ == 0) && Schedule.spaced(100.millis))
+        afterRetire <- local.stream(jqueryJs).runCollect
+        leftover    <- ZIO.attemptBlocking(Option(store.stagingDir.listFiles()).fold(0)(_.length))
         // A new instance (empty index, empty staging) must find the manifest.
-        jars        <- WebJarStore.stagingCache
-        restarted   <- WebJarStore.make(objects, jars, maxConcurrentUploads = 4)
+        dir         <- WebJarStore.stagingDir
+        restarted   <- WebJarStore.make(objects, dir, maxConcurrentUploads = 4)
         afterRestart <- restarted.known(gav)
       yield assertTrue(
         before.isEmpty,
@@ -41,6 +46,8 @@ object WebJarStoreSpec extends ZIOSpecDefault:
         storedBytes == localBytes,
         storedNames == localNames,
         storedNames.contains(jqueryJs),
+        afterRetire == localBytes,
+        leftover == 0,
         afterRestart.exists(isStored),
       )
 
@@ -68,8 +75,8 @@ object WebJarStoreSpec extends ZIOSpecDefault:
       for
         memory    <- Ref.make(Map.empty[StoreKey, Chunk[Byte]]).map(InMemoryObjectStore(_))
         gate      <- Promise.make[Nothing, Unit]
-        jars      <- WebJarStore.stagingCache
-        store     <- WebJarStore.make(GatedObjectStore(memory, gate), jars, maxConcurrentUploads = 1)
+        dir       <- WebJarStore.stagingDir
+        store     <- WebJarStore.make(GatedObjectStore(memory, gate), dir, maxConcurrentUploads = 1)
         first     <- store.fetch(gav)
         rejected  <- store.fetch(otherGav).flip
         joined    <- store.fetch(gav)

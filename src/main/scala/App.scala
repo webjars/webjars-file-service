@@ -1,4 +1,4 @@
-import com.jamesward.zio_mavencentral.{GavCacheMiddleware, JarCache, MavenCentral}
+import com.jamesward.zio_mavencentral.{GavCacheMiddleware, MavenCentral}
 import zio.*
 import zio.http.*
 import zio.http.codec.PathCodec
@@ -121,7 +121,7 @@ object App extends ZIOAppDefault:
    */
   val snapshotLogger: ZIO[WebJarStore, Nothing, Long] =
     ZIO.serviceWithZIO[WebJarStore]: store =>
-      store.jars.size.zip(store.jars.totalBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy) =>
+      store.stagedCount.zip(store.stagedBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy) =>
         ZIO.succeed:
           val heap          = memoryBean.getHeapMemoryUsage.nn
           val (oldUsed, oldMax) = oldGenPool match
@@ -158,32 +158,34 @@ object App extends ZIOAppDefault:
    * route handlers use: `NotFoundError` → `FileNotFoundException` (404),
    * `UpstreamCorruptError` (Maven Central served bytes that aren't a valid
    * jar, e.g. `webvr-polyfill-dpdb/1.0.7.jar` is 16 KB of null bytes) →
-   * [[WebJarCorruptException]] (422), [[UploadsBusy]] →
-   * [[UploadsBusyException]] (503).
+   * [[WebJarCorruptException]] (422), [[UploadsBusy]] / [[UpstreamUnavailable]]
+   * → [[TemporarilyUnavailableException]] (503).
    */
   private def fetch(gav: MavenCentral.GroupArtifactVersion): ZIO[FilesEnv, java.io.IOException, WebJarSource] =
     ZIO.serviceWithZIO[WebJarStore](_.fetch(gav)).mapError:
       case _: MavenCentral.NotFoundError =>
         FileNotFoundException(s"WebJar not found: $gav")
-      case e: JarCache.UpstreamCorruptError =>
+      case e: UpstreamCorrupt =>
         WebJarCorruptException(s"WebJar bytes are corrupt: ${e.gav} (size=${e.sizeBytes}B): ${e.reason}")
-      case UploadsBusy(_) =>
-        UploadsBusyException(s"WebJar $gav is not stored yet and all upload slots are busy")
+      case _: UploadsBusy =>
+        TemporarilyUnavailableException(s"WebJar $gav is not stored yet and all upload slots are busy")
+      case e: UpstreamUnavailable =>
+        TemporarilyUnavailableException(s"WebJar $gav could not be fetched from Maven Central: ${e.reason}")
 
   /** The source for a GAV, downloading it from Maven Central if it isn't stored or staged. */
   def webJarSource(gav: MavenCentral.GroupArtifactVersion): ZIO[FilesEnv, java.io.IOException, WebJarSource] =
     ZIO.serviceWithZIO[WebJarStore](_.known(gav)).someOrElseZIO(fetch(gav))
 
   final class WebJarCorruptException(message: String) extends java.io.IOException(message)
-  final class UploadsBusyException(message: String) extends java.io.IOException(message)
+  final class TemporarilyUnavailableException(message: String) extends java.io.IOException(message)
 
-  /** How long clients should wait before retrying a busy miss. */
+  /** How long clients should wait before retrying a 503. */
   private val busyRetryAfter: Duration = 30.seconds
 
   /**
    * Map an error from a `/files`/`/listfiles`/`/numfiles` request flow
    * to an HTTP response. [[WebJarCorruptException]] becomes 422 (the
-   * artifact exists but cannot be processed); [[UploadsBusyException]]
+   * artifact exists but cannot be processed); [[TemporarilyUnavailableException]]
    * becomes an uncacheable 503 with `Retry-After`; every other failure
    * shape collapses to 404 (the artifact / file isn't here).
    */
@@ -194,7 +196,7 @@ object App extends ZIOAppDefault:
           Status.UnprocessableEntity,
           body = Body.fromString(t.getMessage),
         )
-      case _: UploadsBusyException =>
+      case _: TemporarilyUnavailableException =>
         Response(
           Status.ServiceUnavailable,
           Headers(Header.Custom("Retry-After", busyRetryAfter.toSeconds.toString), Header.CacheControl.NoStore),
