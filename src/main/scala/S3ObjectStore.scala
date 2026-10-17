@@ -29,7 +29,7 @@ final case class S3ObjectStore(
     ZIO.scopeWith: outer =>
       outer.fork.flatMap: connection =>
         signed(Method.GET, objectUrl(key), Headers.empty, Body.empty, SigV4.emptyPayloadHash)
-          .flatMap(req => connection.extend(client.request(req)))
+          .flatMap(req => connection.extend(Client.streaming(req).provideSomeEnvironment[Scope](_.add(client))))
           .flatMap: resp =>
             resp.status match
               case Status.Ok =>

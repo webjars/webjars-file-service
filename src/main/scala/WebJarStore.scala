@@ -238,7 +238,7 @@ final case class WebJarStore(
                   .map(_._1)
       manifest  = Manifest(jar.meta.maybeLastModified, jar.meta.maybeEtag.map(_.renderedValue), names)
       json     <- Body.json(manifest).asChunk
-      _        <- objects.write(manifestKey(gav), json.toArray, Some(MediaType.application.json))
+      _        <- filePermits.withPermit(objects.write(manifestKey(gav), json.toArray, Some(MediaType.application.json)))
       _        <- stored.update(_.updated(gav, StoredGav(manifest.meta, versionedLayout(gav, names))))
       _        <- absent.update(_ - gav)
       _        <- ZIO.logInfo(s"webjar_uploaded gav=$gav files=${names.size} duration_ms=${duration.toMillis}")
