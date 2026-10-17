@@ -6,9 +6,24 @@
 - MCP server `sbt-mcp-webjars-file-service` (sbt-mcp) listens on `http://127.0.0.1:5115/`. Kiro uses the HTTP entry in `.kiro/settings/mcp.json`; start sbt first. Claude Code uses `.mcp.json`, which runs `.claude/sbt-mcp-stdio.sh` (approved in `.claude/settings.json`). That stdio bridge starts a foreground sbt in cloud sessions (`CLAUDE_CODE_REMOTE=true`), and locally only connects to an sbt you already started. Its tools are deferred: load them with ToolSearch (search `sbt-mcp-webjars-file-service`). Diagnostics go to `/tmp/sbt-mcp-stdio.log` and `/tmp/sbt-mcp-server.log`.
 - Maintenance routine: `.factory/MAINTENANCE.md` (weekly), following the `zen-of-projects` Skill.
 
+## Build, Test & Dev Workflow
+
+- Use the MCP server `sbta` (this build's `./sbta --mcp`) for all sbt work: build, test and run
+  with `compile`, `test` (`tests` for specific classes, `full` for all), `run`, `clean` and
+  `publish-local`; inspect the build with `projects`, `test-names`, `main-classes`, `dependencies` and
+  `show`. Use `sbt-task` for any other command (e.g. `reload`) and `list-tasks` to find tasks. Don't run
+  `sbt` or `./sbta` in a shell while the MCP tools are available; if the server is unavailable, say so and
+  fall back to `./sbta <command>`.
+- After editing Scala 3 sources, check them with `check` (pass the edited files: a fast type check
+  without compiling; `"scope":"module"` after changing an API), then run `compile` and `test` before
+  declaring the work done.
+- For Scala symbols use `glob-search` (find or list), `inspect` (members and signatures) and
+  `symbol-location` (source location) rather than text search or guessing APIs. JavaDoc/ScalaDoc
+  lookups are the proxied javadocs.dev tools of the same server.
+
 ## Storage and development
 
-- Webjar files are stored in S3 (`ObjectStore` / `WebJarStore`). On a miss the GAV takes one of 16 upload slots (all busy → 503 + `Retry-After`); its jar is downloaded to local staging (`StagedJar`), served from there while every webjar file plus a `manifests/<g>/<a>/<v>.json` marker is uploaded, then deleted; afterwards the GAV is served from S3.
+- Webjar files are stored in S3 (`ObjectStore` / `WebJarStore`). On a miss the GAV takes one of 64 upload slots (all busy → 503 + `Retry-After`); its jar is downloaded to local staging (`StagedJar`), served from there while every webjar file plus a `manifests/<g>/<a>/<v>.json` marker is uploaded, then deleted; afterwards the GAV is served from S3.
 - Production (`App`) requires `S3_BUCKET` and `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `AWS_REGION` defaults to `us-east-1`.
 - `./sbt Test/run` starts `AppTest`: it uses real S3 when `S3_BUCKET` and `AWS_ACCESS_KEY_ID` are set, otherwise a Floci (`floci/floci:2.3.0`) container simulating S3. Docker is required for that and for `S3ObjectStoreSpec` / `WebJarStoreSpec`.
 - S3 access is our own client (`S3ObjectStore` over zio-http, `SigV4` signing; no AWS SDK). Floci can't validate SigV4 (it ignores the secret and doesn't re-encode the path like S3), so signing is covered by `SigV4Spec` (AWS's documented example) and the real-S3 suite in `S3ObjectStoreSpec`, which runs only when `S3_INTEGRATION=true`: `(set -a; . ./.env.local; set +a; export S3_INTEGRATION=true; ./sbt shutdown; ./sbt testFull)`. It writes small objects under `test/` in the local bucket, which a lifecycle rule expires after a day.
