@@ -263,6 +263,31 @@ object AppSpec extends ZIOSpecDefault:
             annotations.get("x-original-referer").contains("https://original.example/page"),
           )
       },
+
+      test("requestHeaderDump logs every request header and redacts credentials") {
+        val request = Request
+          .get(URL.decode("/header-dump-test").toOption.get)
+          .addHeaders(
+            Headers(
+              Header.UserAgent.parse("jsdelivr-origin/2.6.1").toOption.get,
+              Header.Custom("X-Some-Vendor-Header", "abc123"),
+              Header.Custom("Cookie", "session=secret"),
+            )
+          )
+        val dumpApp = Routes(Method.GET / "header-dump-test" -> Handler.ok) @@ App.requestHeaderDump
+
+        for
+          _      <- dumpApp.runZIO(request)
+          output <- ZTestLogger.logOutput
+          line    = output.map(_.message()).find(_.startsWith("request_headers url=/header-dump-test"))
+        yield
+          assertTrue(
+            line.exists(_.contains("user-agent: jsdelivr-origin/2.6.1")),
+            line.exists(_.contains("x-some-vendor-header: abc123")),
+            line.exists(_.contains("cookie: <redacted>")),
+            !line.exists(_.contains("secret")),
+          )
+      },
     ),
 
     // Exercise the full deployed pipeline (cache middleware, strip/restore

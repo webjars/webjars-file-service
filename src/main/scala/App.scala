@@ -561,6 +561,32 @@ object App extends ZIOAppDefault:
     HandlerAspect.requestLogging(loggedRequestHeaders = loggedRequestHeaders)
 
   /**
+   * TEMPORARY (2026-10 jsDelivr crawl flood): log every request header so we
+   * can see whether jsDelivr forwards anything identifying the end client
+   * (beyond the `jsdelivr-origin` User-Agent) that would let us tell real
+   * users apart from crawlers. Remove once we've looked.
+   *
+   * Credential-bearing headers are redacted rather than dropped, so their
+   * presence is still visible.
+   */
+  private val redactedRequestHeaders: Set[String] =
+    Set("authorization", "proxy-authorization", "cookie")
+
+  def renderRequestHeaders(headers: Headers): String =
+    headers.toList
+      .map: h =>
+        val name  = h.headerName.toLowerCase(java.util.Locale.ROOT).nn
+        val value = if redactedRequestHeaders.contains(name) then "<redacted>" else h.renderedValue
+        s"$name: $value"
+      .mkString(" | ")
+
+  val requestHeaderDump: HandlerAspect[Any, Unit] =
+    HandlerAspect.interceptIncomingHandler:
+      Handler.fromFunctionZIO[Request]: request =>
+        ZIO.logInfo(s"request_headers url=${request.url.encode} headers=${renderRequestHeaders(request.headers)}")
+          .as((request, ()))
+
+  /**
    * The full HTTP app as deployed: `/files`-prefixed routes go through
    * `GavCacheMiddleware` (with the strip/restore bracket); everything
    * else routes directly. CORS and request logging wrap the whole thing.
@@ -573,6 +599,7 @@ object App extends ZIOAppDefault:
     (cachedFilesRoutes ++ otherRoutes)
       @@ corsMiddleware
       @@ requestLogging
+      @@ requestHeaderDump
 
   override val run =
     (snapshotLogger.forkDaemon *> Server.serve(app)).provide(
