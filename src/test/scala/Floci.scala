@@ -1,8 +1,7 @@
 import io.floci.testcontainers.FlociContainer
-import software.amazon.awssdk.regions.Region
 import zio.*
+import zio.http.URL
 
-import java.net.URI
 import java.util.UUID
 
 /** Local S3 emulator (Floci) for tests and for `Test/run` without AWS credentials. */
@@ -27,6 +26,10 @@ object Floci:
         case Some((users, c)) => ZIO.succeed((c, Some((users + 1, c))))
         case None =>
           ZIO.attemptBlocking:
+            // Signature validation stays off: Floci doesn't check the secret, and it
+            // builds the canonical URI from the raw wire path where real S3
+            // re-encodes it, so it would reject correct signatures for keys with
+            // `*`, `:` or `@`. SigV4 is covered by SigV4Spec and the real-S3 suite.
             val c = FlociContainer(image).disableAllServices().withS3Config(_.enabled(true))
             c.start()
             (c, Some((1, c)))
@@ -37,14 +40,22 @@ object Floci:
         case None             => ZIO.none
     )
 
-  /** An [[ObjectStore]] on a fresh, uniquely named bucket in the shared Floci container. */
+  /** An [[S3ObjectStore]] on a fresh, uniquely named bucket in the shared Floci container. */
+  val s3: ZIO[Scope, Throwable, S3ObjectStore] =
+    for
+      c        <- container
+      endpoint <- ZIO.fromEither(URL.decode(c.getEndpoint))
+      bucket    = BucketName(s"webjars-${UUID.randomUUID()}")
+      config    = S3ObjectStore.Config(
+                    bucket,
+                    AwsRegion(c.getRegion),
+                    S3ObjectStore.Addressing.PathStyle(endpoint),
+                    AwsCredentials(c.getAccessKey, c.getSecretKey, None),
+                  )
+      store    <- S3ObjectStore.scoped(config)
+      _        <- store.createBucket
+      _        <- ZIO.logInfo(s"floci endpoint=${c.getEndpoint} bucket=${bucket.value}")
+    yield store
+
   val objectStore: ZLayer[Any, Throwable, ObjectStore] =
-    ZLayer.scoped:
-      for
-        c      <- container
-        s3     <- zio.s3.liveZIO(Region.of(c.getRegion).nn, zio.s3.providers.basic(c.getAccessKey, c.getSecretKey), Some(URI(c.getEndpoint)), Some(true))
-                    .build.map(_.get[zio.s3.S3])
-        bucket  = BucketName(s"webjars-${UUID.randomUUID()}")
-        _      <- s3.createBucket(bucket.value)
-        _      <- ZIO.logInfo(s"floci endpoint=${c.getEndpoint} bucket=${bucket.value}")
-      yield S3ObjectStore(s3, bucket)
+    ZLayer.scoped(s3)

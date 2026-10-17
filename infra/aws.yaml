@@ -4,6 +4,12 @@ Resources:
   Bucket:
     Type: AWS::S3::Bucket
     Properties:
+      LifecycleConfiguration:
+        Rules:
+        - ExpirationInDays: 1
+          Id: expire-integration-test-objects
+          Prefix: test/
+          Status: Enabled
       OwnershipControls:
         Rules:
         - ObjectOwnership: BucketOwnerEnforced

@@ -1,20 +1,15 @@
 import zio.*
+import zio.http.MediaType
 import zio.stream.ZStream
 
-/** Fake [[ObjectStore]] for fast tests; the Floci-backed spec covers the real S3 client. */
+/** Fake [[ObjectStore]] for fast tests; the Floci/S3 specs cover the real client. */
 final case class InMemoryObjectStore(objects: Ref[Map[StoreKey, Chunk[Byte]]]) extends ObjectStore:
-  def size(key: StoreKey): Task[Option[Long]] =
-    objects.get.map(_.get(key).map(_.length.toLong))
+  def get(key: StoreKey): ZIO[Scope, Throwable, Option[StoredObject]] =
+    objects.get.map(_.get(key).map(bytes => StoredObject(Some(bytes.length.toLong), ZStream.fromChunk(bytes))))
 
-  def stream(key: StoreKey): ZStream[Any, Throwable, Byte] =
-    ZStream.fromZIO(read(key).someOrFail(java.nio.file.NoSuchFileException(key.value))).flattenChunks
-
-  def read(key: StoreKey): Task[Option[Chunk[Byte]]] =
-    objects.get.map(_.get(key))
-
-  def write(key: StoreKey, bytes: Chunk[Byte], contentType: Option[String]): Task[Unit] =
-    objects.update(_.updated(key, bytes))
+  def write(key: StoreKey, bytes: Array[Byte], contentType: Option[MediaType]): Task[Unit] =
+    objects.update(_.updated(key, Chunk.fromArray(bytes)))
 
 object InMemoryObjectStore:
-  val layer: ULayer[ObjectStore & InMemoryObjectStore] =
-    ZLayer.fromZIO(Ref.make(Map.empty[StoreKey, Chunk[Byte]]).map(InMemoryObjectStore(_)))
+  val make: UIO[InMemoryObjectStore] = Ref.make(Map.empty[StoreKey, Chunk[Byte]]).map(InMemoryObjectStore(_))
+  val layer: ULayer[ObjectStore] = ZLayer.fromZIO(make)

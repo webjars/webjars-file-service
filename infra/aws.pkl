@@ -33,6 +33,18 @@ Resources {
         new { ObjectOwnership = "BucketOwnerEnforced" }
       }
     }
+    // S3ObjectStoreSpec's real-S3 suite writes under test/ and the service
+    // user can't delete; the service itself never writes there.
+    LifecycleConfiguration {
+      Rules {
+        new {
+          Id = "expire-integration-test-objects"
+          Status = "Enabled"
+          Prefix = "test/"
+          ExpirationInDays = 1
+        }
+      }
+    }
   }
 
   ["User"] = new iamuser.User {

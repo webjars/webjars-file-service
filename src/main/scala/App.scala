@@ -97,6 +97,7 @@ object App extends ZIOAppDefault:
    * is the model we want to validate.
    */
   private val memoryBean = ManagementFactory.getMemoryMXBean.nn
+  private val threadBean = ManagementFactory.getThreadMXBean.nn
 
   private val oldGenPool: Option[MemoryPoolMXBean] =
     ManagementFactory.getMemoryPoolMXBeans.nn.asScala.toList
@@ -121,7 +122,7 @@ object App extends ZIOAppDefault:
    */
   val snapshotLogger: ZIO[WebJarStore, Nothing, Long] =
     ZIO.serviceWithZIO[WebJarStore]: store =>
-      store.stagedCount.zip(store.stagedBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy) =>
+      store.stagedCount.zip(store.stagedBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).zip(store.absentCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy, absentGavs) =>
         ZIO.succeed:
           val heap          = memoryBean.getHeapMemoryUsage.nn
           val (oldUsed, oldMax) = oldGenPool match
@@ -132,8 +133,8 @@ object App extends ZIOAppDefault:
           val directUsed = directBufferPool.fold(0L)(_.getMemoryUsed)
           val openFds    = unixOsBean.fold(-1L)(_.getOpenFileDescriptorCount)
           val inFlight   = inFlightStreams.get()
-          (heap.getUsed, heap.getMax, oldUsed, oldMax, directUsed, openFds, inFlight)
-        .flatMap: (heapUsed, heapMax, oldUsed, oldMax, directUsed, openFds, inFlight) =>
+          (heap.getUsed, heap.getMax, oldUsed, oldMax, directUsed, openFds, inFlight, threadBean.getThreadCount, threadBean.getPeakThreadCount)
+        .flatMap: (heapUsed, heapMax, oldUsed, oldMax, directUsed, openFds, inFlight, threads, peakThreads) =>
           ZIO.logInfo(
             s"memory_snapshot " +
               s"heap_used_mb=${heapUsed / 1024 / 1024} " +
@@ -142,10 +143,13 @@ object App extends ZIOAppDefault:
               s"old_max_mb=${oldMax / 1024 / 1024} " +
               s"direct_used_mb=${directUsed / 1024 / 1024} " +
               s"open_fds=$openFds " +
+              s"threads=$threads " +
+              s"peak_threads=$peakThreads " +
               s"staged_jars=$staged " +
               s"staged_mb=${stagedBytes / 1024 / 1024} " +
               s"stored_gavs=$storedGavs " +
               s"uploading_gavs=$uploadingGavs " +
+              s"absent_gavs=$absentGavs " +
               s"uploads_busy_total=$busy " +
               s"in_flight_streams=$inFlight"
           )
@@ -216,88 +220,71 @@ object App extends ZIOAppDefault:
 
   /** Stream the bytes of a single jar entry; fails with `NoSuchFileException` if it's missing. */
   def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[FilesEnv, Throwable, Byte] =
-    ZStream.fromZIO(webJarSource(gav)).flatMap: source =>
-      ZStream.fromZIO(source.hasFile(entryPath)).flatMap: exists =>
-        if exists then source.stream(entryPath)
-        else ZStream.fail(java.nio.file.NoSuchFileException(entryPath))
-
-  case class FileDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], file: String)
+    ZStream.unwrapScoped:
+      webJarSource(gav).flatMap(_.open(entryPath)).someOrFail(java.nio.file.NoSuchFileException(entryPath))
 
   /**
-   * Resolve a request path to a jar entry, tolerating the two layouts
-   * webjars use in practice (with or without the version segment in
-   * the resource path).
+   * Respond with a webjar file. Conditional requests are answered without
+   * touching storage; otherwise the first existing candidate entry (see
+   * [[WebJarSource.candidates]]) is streamed. The body stream lives in the
+   * request's scope, which the server closes once the response is sent.
    */
-  def findFile(gav: MavenCentral.GroupArtifactVersion, source: WebJarSource, file: Path): Task[FileDetails] =
-    val withVersion    = s"$webJarsPathPrefix/${gav.artifactId}/${gav.version}/$file"
-    val withoutVersion = s"$webJarsPathPrefix/${gav.artifactId}/$file"
-    def details(entry: String) =
-      FileDetails(source.meta.maybeEtag, source.meta.maybeLastModified.map(Header.LastModified(_)), entry)
-    source.hasFile(withVersion).flatMap: hasV =>
-      if hasV then ZIO.succeed(details(withVersion))
-      else
-        source.hasFile(withoutVersion).flatMap: hasNV =>
-          if hasNV then ZIO.succeed(details(withoutVersion))
-          else ZIO.fail(FileNotFoundException(s"$file not found in WebJar"))
+  def serveFile(source: WebJarSource, file: Path, request: Request): ZIO[Scope, Throwable, Response] =
+    val etag         = source.meta.maybeEtag
+    val lastModified = source.meta.maybeLastModified.map(Header.LastModified(_))
 
-  def serveFile(source: WebJarSource, fileDetails: FileDetails, request: Request): Response =
-    val maybeFileExt = fileDetails.file.split('.').lastOption
-    val maybeMimeType = maybeFileExt.flatMap(MediaType.forFileExtension)
-
-    val commonHeaders = Headers(Header.CacheControl.Multiple(NonEmptyChunk(Header.CacheControl.Public, Header.CacheControl.MaxAge(31536000), Header.CacheControl.Immutable)))
-      .addHeaders(Headers(maybeMimeType.map(Header.ContentType(_)).toSeq))
-      .addHeaders(Headers(fileDetails.etag.toSeq))
-      .addHeaders(Headers(fileDetails.lastModified.toSeq))
-
-    val clientEtag = request.header(Header.IfNoneMatch)
-    val etagMatches = (clientEtag, fileDetails.etag) match
+    val etagMatches = (request.header(Header.IfNoneMatch), etag) match
       case (Some(ifNoneMatch), Some(serverEtag)) =>
         ifNoneMatch.renderedValue.contains(serverEtag.renderedValue) ||
           ifNoneMatch.renderedValue.contains("*")
       case _ => false
 
-    val clientIfModifiedSince = request.header(Header.IfModifiedSince)
-    val notModified = (clientIfModifiedSince, fileDetails.lastModified) match
+    val notModified = (request.header(Header.IfModifiedSince), lastModified) match
       case (Some(ifModifiedSince), Some(serverLastModified)) =>
-        val clientTime = ifModifiedSince.value
-        !serverLastModified.value.isAfter(clientTime)
+        !serverLastModified.value.isAfter(ifModifiedSince.value)
       case _ => false
 
+    def headers(entry: String) =
+      Headers(Header.CacheControl.Multiple(NonEmptyChunk(Header.CacheControl.Public, Header.CacheControl.MaxAge(31536000), Header.CacheControl.Immutable)))
+        .addHeaders(Headers(entry.split('.').lastOption.flatMap(MediaType.forFileExtension).map(Header.ContentType(_)).toSeq))
+        .addHeaders(Headers(etag.toSeq))
+        .addHeaders(Headers(lastModified.toSeq))
+
     if etagMatches || notModified then
-      Response(
-        status = Status.NotModified,
-        headers = commonHeaders,
-      )
+      ZIO.succeed(Response(status = Status.NotModified, headers = headers(file.encode)))
     else
-      // `unwrapScoped` + `acquireRelease` keeps the `inFlightStreams` gauge
-      // accurate across success, stream error, and client interrupt (H27):
-      // the scope spans the whole body stream's lifetime.
-      val entryStream: ZStream[Any, Throwable, Byte] =
-        ZStream.unwrapScoped[Any]:
-          ZIO.acquireRelease(
-            ZIO.succeed { inFlightStreams.incrementAndGet(); () }
-          )(_ => ZIO.succeed { inFlightStreams.decrementAndGet(); () })
-            .as(source.stream(fileDetails.file))
-      Response(
-        status  = Status.Ok,
-        headers = commonHeaders,
-        body    = Body.fromStreamChunked(entryStream),
-      )
+      firstExisting(source, source.candidates(file.encode)).map: (entry, body) =>
+        // `unwrapScoped` + `acquireRelease` keeps the `inFlightStreams` gauge
+        // accurate across success, stream error, and client interrupt (H27).
+        val counted: ZStream[Any, Throwable, Byte] =
+          ZStream.unwrapScoped[Any]:
+            ZIO.acquireRelease(ZIO.succeed(inFlightStreams.incrementAndGet()))(_ => ZIO.succeed(inFlightStreams.decrementAndGet()))
+              .as(body)
+        Response(status = Status.Ok, headers = headers(entry), body = Body.fromStreamChunked(counted))
+
+  private def firstExisting(source: WebJarSource, entries: List[String]): ZIO[Scope, Throwable, (String, ZStream[Any, Throwable, Byte])] =
+    entries match
+      case Nil => ZIO.fail(FileNotFoundException("file not found in WebJar"))
+      case entry :: rest =>
+        source.open(entry).flatMap:
+          case Some(body) => ZIO.succeed(entry -> body)
+          case None       => firstExisting(source, rest)
 
   def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[FilesEnv, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
-    Handler.fromZIO:
-      if gav.groupId.toString.startsWith("org.webjars") then
-        ZIO.serviceWithZIO[WebJarStore](_.known(gav)).flatMap: maybeSource =>
-          val sourceLabel = maybeSource.fold("MISS"):
-            case _: WebJarSource.Stored => "STORED"
-            case _: WebJarSource.Local  => "LOCAL"
-          ZIO.logInfo(s"webjar_source=$sourceLabel gav=$gav") *>
-            maybeSource.fold(fetch(gav))(ZIO.succeed(_))
-              .flatMap(source => findFile(gav, source, file).map(serveFile(source, _, request)))
-              .catchAll(e => ZIO.succeed(errorResponse(e)))
-      else
-        val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
-        ZIO.succeed(Response.redirect(request.url.path(path), true))
+    Handler.scoped[FilesEnv]:
+      Handler.fromZIO:
+        if gav.groupId.toString.startsWith("org.webjars") then
+          ZIO.serviceWithZIO[WebJarStore](_.known(gav)).flatMap: maybeSource =>
+            val sourceLabel = maybeSource.fold("MISS"):
+              case _: WebJarSource.Stored => "STORED"
+              case _: WebJarSource.Local  => "LOCAL"
+            ZIO.logInfo(s"webjar_source=$sourceLabel gav=$gav") *>
+              maybeSource.fold(fetch(gav))(ZIO.succeed(_))
+                .flatMap(serveFile(_, file, request))
+                .catchAll(e => ZIO.succeed(errorResponse(e)))
+        else
+          val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
+          ZIO.succeed(Response.redirect(request.url.path(path), true))
 
   def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[FilesEnv, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     Handler.fromZIO:
