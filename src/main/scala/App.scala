@@ -16,9 +16,9 @@ object App extends ZIOAppDefault:
   given CanEqual[Method, Method] = CanEqual.derived
   given CanEqual[Status, Status] = CanEqual.derived
 
-  val webJarsPathPrefix = "META-INF/resources/webjars"
+  val webJarsPathPrefix: String = WebJarStore.webJarsPathPrefix
 
-  type FilesEnv = Client & JarCache & MavenCentral.MavenCentralRepo & LoadShedder
+  type FilesEnv = Client & MavenCentral.MavenCentralRepo & WebJarStore
 
   // todo: use CORS Middleware from ZIO HTTP: https://ziohttp.com/reference/aop/middleware#access-control-allow-origin-cors-middleware
   // CORS middleware that adds Access-Control-Allow-Origin: * to all responses
@@ -77,20 +77,13 @@ object App extends ZIOAppDefault:
         ZIO.succeed((request.updatePath(p => FilesPrefix ++ p), ()))
 
   /**
-   * Counter of HTTP responses currently streaming bytes from a cached jar.
-   * Incremented when `serveFile` opens a `streamEntry` and decremented when
-   * the response body's scope closes (success, error, or interrupt).
-   *
-   * Read by `snapshotLogger`. Used to disambiguate "JarCache is the source
-   * of retained heap" from "per-request streams are leaking on cancellation":
-   * if this number stays small/stationary while heap climbs, the cache is
-   * the leak; if it climbs without bound, individual requests are leaking
-   * resources (and the H27 client-interrupt logs are a likely cause).
+   * Counter of HTTP responses currently streaming a webjar file (from the
+   * object store or a staged local jar). Incremented when the response body
+   * starts and decremented when its scope closes (success, error, or
+   * interrupt). If it climbs without bound, requests are leaking streams.
    */
   private val inFlightStreams: AtomicLong = AtomicLong(0L)
 
-  val loadShedderLayer: ZLayer[Any, Nothing, LoadShedder] =
-    LoadShedder.layer(LoadShedder.defaultConfig, ZIO.succeed(inFlightStreams.get()))
 
   /**
    * JVM management beans, captured once at class init. `oldGenPool` and
@@ -121,27 +114,14 @@ object App extends ZIOAppDefault:
       case _                                               => None
 
   /**
-   * Background fiber: emit a structured snapshot every 30s correlating
-   * heap/old-gen/direct/fd counts with the JarCache's own size and the
-   * in-flight stream count.
-   *
-   * Every value is on one log line so a single `grep memory_snapshot` over
-   * a long log window plots cleanly. The disambiguation we want from this
-   * log is:
-   *
-   *   - cache_jars climbs ↔ old_used_mb climbs        → cache is the leak
-   *   - cache_jars flat,    old_used_mb climbs        → per-request leak
-   *   - open_fds ≈ cache_jars + small constant        → confirms 1 ZipFile per cache entry
-   *   - in_flight_streams stays small/stationary      → no per-request stream leak
-   *   - direct_used_mb stays tiny                     → not an off-heap problem
-   *
-   * Sampled values are pre-GC for heap (the JVM's own ergonomics dictate
-   * when GC runs); the unified GC log enabled in `Procfile` provides
-   * post-GC heap for the same time series.
+   * Background fiber: emit a structured snapshot every 30s of heap/old-gen/
+   * direct/fd counts alongside the staging jar cache, the object-store
+   * population state (including busy rejections), and the in-flight stream count.
+   * Every value is on one line so `grep memory_snapshot` plots cleanly.
    */
-  val snapshotLogger: ZIO[JarCache & LoadShedder, Nothing, Long] =
-    ZIO.serviceWithZIO[JarCache]: cache =>
-      cache.size.zip(cache.totalBytes).zip(cache.warmCount).flatMap: (jars, cacheBytes, warm) =>
+  val snapshotLogger: ZIO[WebJarStore, Nothing, Long] =
+    ZIO.serviceWithZIO[WebJarStore]: store =>
+      store.jars.size.zip(store.jars.totalBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy) =>
         ZIO.succeed:
           val heap          = memoryBean.getHeapMemoryUsage.nn
           val (oldUsed, oldMax) = oldGenPool match
@@ -154,136 +134,57 @@ object App extends ZIOAppDefault:
           val inFlight   = inFlightStreams.get()
           (heap.getUsed, heap.getMax, oldUsed, oldMax, directUsed, openFds, inFlight)
         .flatMap: (heapUsed, heapMax, oldUsed, oldMax, directUsed, openFds, inFlight) =>
-          ZIO.serviceWithZIO[LoadShedder](_.snapshot.flatMap(_.render)).flatMap: shedding =>
-            ZIO.logInfo(
-              s"memory_snapshot " +
-                s"heap_used_mb=${heapUsed / 1024 / 1024} " +
-                s"heap_max_mb=${heapMax / 1024 / 1024} " +
-                s"old_used_mb=${oldUsed / 1024 / 1024} " +
-                s"old_max_mb=${oldMax / 1024 / 1024} " +
-                s"direct_used_mb=${directUsed / 1024 / 1024} " +
-                s"open_fds=$openFds " +
-                s"cache_jars=$jars " +
-                s"cache_warm=$warm " +
-                s"cache_mb=${cacheBytes / 1024 / 1024} " +
-                s"in_flight_streams=$inFlight " +
-                shedding
-            )
+          ZIO.logInfo(
+            s"memory_snapshot " +
+              s"heap_used_mb=${heapUsed / 1024 / 1024} " +
+              s"heap_max_mb=${heapMax / 1024 / 1024} " +
+              s"old_used_mb=${oldUsed / 1024 / 1024} " +
+              s"old_max_mb=${oldMax / 1024 / 1024} " +
+              s"direct_used_mb=${directUsed / 1024 / 1024} " +
+              s"open_fds=$openFds " +
+              s"staged_jars=$staged " +
+              s"staged_mb=${stagedBytes / 1024 / 1024} " +
+              s"stored_gavs=$storedGavs " +
+              s"uploading_gavs=$uploadingGavs " +
+              s"uploads_busy_total=$busy " +
+              s"in_flight_streams=$inFlight"
+          )
     .repeat(Schedule.fixed(30.seconds))
 
   case class JarDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], contents: ZStream[Any, Throwable, String])
 
   /**
-   * Cache of fully-downloaded webjars on disk plus open `ZipFile` handles.
-   * Backed by `zio-mavencentral`'s [[JarCache]]: each entry owns one
-   * immutable `.jar` file and (when warm) one `ZipFile` handle. Reads
-   * use random access into the jar — no extracted directory, no
-   * streaming-time deletion races.
-   *
-   * Sizing
-   * ------
-   * `warmIdleTtl` controls the heap working set, and under our
-   * crawler-driven long-tail load it is effectively what sets peak
-   * heap. Because almost every requested GAV is fetched roughly once
-   * and then goes idle, the warm set converges to
-   * `unique_arrival_rate × warmIdleTtl`; genuinely hot webjars
-   * (jQuery, Bootstrap, openui5, etc.) reset their idle timer on every
-   * hit and stay warm regardless, so a short TTL sheds only the
-   * one-shot long tail.
-   *
-   * Sized from the 2026-08-02 OOM incident telemetry: on the
-   * Standard-2X dyno `heap_max_mb = 672`, heap-per-warm-jar ≈ 0.45 MB
-   * (dominated by the ZipFile central directory), and the flood drove
-   * ~27 unique jars/s. The previous `30.minutes` let the warm set grow
-   * unbounded — `snapshotLogger` showed cache_jars 0 → 2995 and
-   * heap_used 17 → 607 MB in ~2 min, ending in
-   * `java.lang.OutOfMemoryError: Java heap space` (exit 255) in a tight
-   * crash loop. Targeting ~40–50 % of heap (~650–750 warm jars) gives
-   * `warmIdleTtl ≈ 700 / 27 ≈ 30 s`, so it is set to `30.seconds`.
-   *
-   * `sweepInterval` must be well under `warmIdleTtl` or demotion can't
-   * keep up: at ~27 jars/s a `1.minute` sweep let ~1600 jars accumulate
-   * between runs and OOM before the sweeper fired. Set to `15.seconds`,
-   * bounding the worst case to ~27/s × ~45 s ≈ ~1200 jars ≈ ~540 MB.
-   * Watch `heap_used_mb` after deploy; if it still approaches 672, drop
-   * `warmIdleTtl` toward 20 s.
-   *
-   * Note this is inherently rate-dependent (warm_jars = rate × ttl), so
-   * a larger traffic burst can re-break it. The durable fixes are a
-   * bigger dyno/heap or a hard warm-count cap (bounded LRU) in
-   * `zio-mavencentral`'s `JarCache`; this TTL setting is the
-   * survive-the-flood measure on the current tier.
-   *
-   * `coldIdleTtl` controls the on-disk working set. With `Some(...)`,
-   * the sweeper deletes a cached `.jar` once the GAV has been idle for
-   * that long; the next request for that GAV is a full miss and
-   * re-downloads from Maven Central. This bounds Heroku ephemeral
-   * disk usage and (more importantly) the OS page-cache pressure that
-   * was triggering memory-quota kills (status 255) on Standard-2X
-   * dynos when the on-disk corpus grew to 10+ GB.
-   *
-   * For the Standard-2X dyno (1 GB total RAM), the previous setting
-   * (`coldIdleTtl = 1.hour`) was sized for ~14 jars/min × 5 MB/jar →
-   * ~1250 jars × 5 MB ≈ 6 GB on disk. Production telemetry from
-   * `snapshotLogger` (cache_jars ~1700, cache_mb ~9900, R14 firing
-   * every 15–30s) showed actual traffic at ~19 jars/min and
-   * ~5.84 MB/jar — ~1.6× the design size, with the on-disk corpus
-   * pushing the OS page cache past the dyno's RAM quota.
-   *
-   * Was `45.minutes`; dropped to `10.minutes` during the 2026-10 jsDelivr
-   * crawl flood, when cache_jars ~9700 inside the 45-minute window
-   * (~215 new GAVs/min) and cache_mb ~14700 had the dyno pinned at ~170 % of
-   * its memory quota (R14 every ~20 s). Repeat hits for a crawled file are
-   * absorbed by jsDelivr (immutable, 1 year), so a short cold TTL costs
-   * little hit rate. Watch `cache_mb` and the R14 cadence.
-   *
-   * If/when the dyno is bumped to a larger tier (e.g., Performance-M
-   * with 2.5 GB) the `coldIdleTtl` can be raised significantly — or
-   * set to `None` again — to maximize hit rate.
+   * Map the download path's typed errors into the Throwable channel the
+   * route handlers use: `NotFoundError` → `FileNotFoundException` (404),
+   * `UpstreamCorruptError` (Maven Central served bytes that aren't a valid
+   * jar, e.g. `webvr-polyfill-dpdb/1.0.7.jar` is 16 KB of null bytes) →
+   * [[WebJarCorruptException]] (422), [[UploadsBusy]] →
+   * [[UploadsBusyException]] (503).
    */
-  val jarCacheLayer: ZLayer[Client, Nothing, JarCache] =
-    ZLayer.scoped:
-      val cacheDir = Files.createTempDirectory("webjar-cache").nn.toFile
-      JarCache.make(
-        cacheDir,
-        JarCache.httpDownloader(gav => MavenCentral.jarUri(gav.groupId, gav.artifactId, gav.version)),
-        label         = "webjar",
-        warmIdleTtl   = 30.seconds,
-        coldIdleTtl   = Some(10.minutes),
-        sweepInterval = 15.seconds,
-      )  /**
-   * Look up the `JarHandle` for a webjar GAV. Maps the cache's two
-   * typed error variants:
-   *
-   *   - `NotFoundError` — the artifact doesn't exist on Maven Central.
-   *     Surfaced as `FileNotFoundException` (for parity with the
-   *     previous extracted-dir flow); route handlers map this to 404.
-   *   - `UpstreamCorruptError` — Maven Central served bytes for the
-   *     artifact but they don't parse as a valid jar (e.g. the
-   *     real-world `webvr-polyfill-dpdb/1.0.7.jar` which is 16 KB of
-   *     null bytes). Surfaced as [[WebJarCorruptException]]; route
-   *     handlers map this to 422.
-   */
-  private def jarHandle(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, java.io.IOException, JarCache.JarHandle] =
-    ZIO.serviceWithZIO[JarCache](_.get(gav)).mapError:
+  private def fetch(gav: MavenCentral.GroupArtifactVersion): ZIO[FilesEnv, java.io.IOException, WebJarSource] =
+    ZIO.serviceWithZIO[WebJarStore](_.fetch(gav)).mapError:
       case _: MavenCentral.NotFoundError =>
         FileNotFoundException(s"WebJar not found: $gav")
       case e: JarCache.UpstreamCorruptError =>
         WebJarCorruptException(s"WebJar bytes are corrupt: ${e.gav} (size=${e.sizeBytes}B): ${e.reason}")
+      case UploadsBusy(_) =>
+        UploadsBusyException(s"WebJar $gav is not stored yet and all upload slots are busy")
 
-  /**
-   * Marker exception for upstream-corrupt webjars. Defined here (not in
-   * `zio-mavencentral`) because the typed `UpstreamCorruptError` from
-   * the cache is what crosses the library boundary; the exception is
-   * how this app bridges that into the Throwable error channel that
-   * the rest of `App` uses.
-   */
+  /** The source for a GAV, downloading it from Maven Central if it isn't stored or staged. */
+  def webJarSource(gav: MavenCentral.GroupArtifactVersion): ZIO[FilesEnv, java.io.IOException, WebJarSource] =
+    ZIO.serviceWithZIO[WebJarStore](_.known(gav)).someOrElseZIO(fetch(gav))
+
   final class WebJarCorruptException(message: String) extends java.io.IOException(message)
+  final class UploadsBusyException(message: String) extends java.io.IOException(message)
+
+  /** How long clients should wait before retrying a busy miss. */
+  private val busyRetryAfter: Duration = 30.seconds
 
   /**
    * Map an error from a `/files`/`/listfiles`/`/numfiles` request flow
    * to an HTTP response. [[WebJarCorruptException]] becomes 422 (the
-   * artifact exists but cannot be processed); every other failure
+   * artifact exists but cannot be processed); [[UploadsBusyException]]
+   * becomes an uncacheable 503 with `Retry-After`; every other failure
    * shape collapses to 404 (the artifact / file isn't here).
    */
   private def errorResponse(t: Throwable): Response =
@@ -293,35 +194,30 @@ object App extends ZIOAppDefault:
           Status.UnprocessableEntity,
           body = Body.fromString(t.getMessage),
         )
+      case _: UploadsBusyException =>
+        Response(
+          Status.ServiceUnavailable,
+          Headers(Header.Custom("Retry-After", busyRetryAfter.toSeconds.toString), Header.CacheControl.NoStore),
+          Body.fromString(t.getMessage),
+        )
       case _ =>
         Response.notFound(t.getMessage)
 
-  def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, JarDetails] =
-    jarHandle(gav).map: handle =>
-      // Only entries inside `META-INF/resources/webjars/...` are user-visible
-      // webjar content; jar metadata files (`META-INF/MANIFEST.MF`, `pom.xml`,
-      // etc.) are filtered out.
-      JarDetails(
-        handle.meta.maybeEtag,
-        handle.meta.maybeLastModified.map(Header.LastModified(_)),
-        ZStream.fromIterableZIO(
-          handle.filterEntryNames(name => name.startsWith(webJarsPathPrefix) && !name.endsWith("/"))
-            .map(_.toSeq.sorted)
-        ),
-      )
+  def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[FilesEnv, Throwable, JarDetails] =
+    webJarSource(gav).flatMap: source =>
+      source.fileNames.map: names =>
+        JarDetails(
+          source.meta.maybeEtag,
+          source.meta.maybeLastModified.map(Header.LastModified(_)),
+          ZStream.fromIterable(names),
+        )
 
-  /**
-   * Stream the bytes of a single jar entry. Fails with
-   * `java.nio.file.NoSuchFileException` (preserving the previous
-   * extracted-dir behavior) when the entry is missing — matched by
-   * existing tests.
-   */
-  def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, Byte] =
-    ZStream.fromZIO(jarHandle(gav))
-      .flatMap: handle =>
-        ZStream.fromZIO(
-          handle.readEntry(entryPath).orElseFail(new java.nio.file.NoSuchFileException(entryPath))
-        ).flatMap(bytes => ZStream.fromChunk(Chunk.fromArray(bytes)))
+  /** Stream the bytes of a single jar entry; fails with `NoSuchFileException` if it's missing. */
+  def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[FilesEnv, Throwable, Byte] =
+    ZStream.fromZIO(webJarSource(gav)).flatMap: source =>
+      ZStream.fromZIO(source.hasFile(entryPath)).flatMap: exists =>
+        if exists then source.stream(entryPath)
+        else ZStream.fail(java.nio.file.NoSuchFileException(entryPath))
 
   case class FileDetails(etag: Option[Header.ETag], lastModified: Option[Header.LastModified], file: String)
 
@@ -330,18 +226,19 @@ object App extends ZIOAppDefault:
    * webjars use in practice (with or without the version segment in
    * the resource path).
    */
-  def findFile(gav: MavenCentral.GroupArtifactVersion, file: Path): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, FileDetails] =
-    jarHandle(gav).flatMap: handle =>
-      val withVersion    = s"$webJarsPathPrefix/${gav.artifactId}/${gav.version}/$file"
-      val withoutVersion = s"$webJarsPathPrefix/${gav.artifactId}/$file"
-      handle.hasEntry(withVersion).flatMap: hasV =>
-        if hasV then ZIO.succeed(FileDetails(handle.meta.maybeEtag, handle.meta.maybeLastModified.map(Header.LastModified(_)), withVersion))
-        else
-          handle.hasEntry(withoutVersion).flatMap: hasNV =>
-            if hasNV then ZIO.succeed(FileDetails(handle.meta.maybeEtag, handle.meta.maybeLastModified.map(Header.LastModified(_)), withoutVersion))
-            else ZIO.fail(FileNotFoundException(s"$file not found in WebJar"))
+  def findFile(gav: MavenCentral.GroupArtifactVersion, source: WebJarSource, file: Path): Task[FileDetails] =
+    val withVersion    = s"$webJarsPathPrefix/${gav.artifactId}/${gav.version}/$file"
+    val withoutVersion = s"$webJarsPathPrefix/${gav.artifactId}/$file"
+    def details(entry: String) =
+      FileDetails(source.meta.maybeEtag, source.meta.maybeLastModified.map(Header.LastModified(_)), entry)
+    source.hasFile(withVersion).flatMap: hasV =>
+      if hasV then ZIO.succeed(details(withVersion))
+      else
+        source.hasFile(withoutVersion).flatMap: hasNV =>
+          if hasNV then ZIO.succeed(details(withoutVersion))
+          else ZIO.fail(FileNotFoundException(s"$file not found in WebJar"))
 
-  def serveFile(gav: MavenCentral.GroupArtifactVersion, fileDetails: FileDetails, request: Request): ZIO[Client & JarCache & MavenCentral.MavenCentralRepo, Throwable, Response] =
+  def serveFile(source: WebJarSource, fileDetails: FileDetails, request: Request): Response =
     val maybeFileExt = fileDetails.file.split('.').lastOption
     val maybeMimeType = maybeFileExt.flatMap(MediaType.forFileExtension)
 
@@ -365,66 +262,42 @@ object App extends ZIOAppDefault:
       case _ => false
 
     if etagMatches || notModified then
-      ZIO.succeed:
-        Response(
-          status = Status.NotModified,
-          headers = commonHeaders,
-        )
+      Response(
+        status = Status.NotModified,
+        headers = commonHeaders,
+      )
     else
-      jarHandle(gav).map: handle =>
-        // Stream the entry's bytes directly into the HTTP response body.
-        // `JarHandle.streamEntry` opens a fresh `InputStream` against the
-        // cached `ZipFile`, reads in 64KB chunks, and closes the stream
-        // when the response body is fully sent (or interrupted). This
-        // avoids the per-request `byte[]` allocation of the previous
-        // `readEntry` + `Body.fromArray` path, which was pinning the
-        // Heroku dyno at >100% memory under load and contributed to
-        // OOM-driven dyno crashes.
-        //
-        // `findFile` already verified the entry exists via `hasEntry`,
-        // so the `JarEntryNotFound` channel here is a defensive guard
-        // against a TOCTOU between findFile and streamEntry — converted
-        // to `NoSuchFileException` for parity with `readEntry`'s prior
-        // behavior.
-        //
-        // Wrapped in an `unwrapScoped` + `acquireRelease` bracket so the
-        // `inFlightStreams` gauge increments when the response consumer
-        // first pulls and decrements when the scope closes — successful
-        // completion, stream error, *and* client interrupt (H27) all run
-        // the release. The scope spans the whole inner stream's lifetime,
-        // not just one of its operands, which is why `unwrapScoped` is
-        // used instead of `acquireReleaseWith ++ entryStream` (concat
-        // closes the first scope before the second runs).
-        val entryStream: ZStream[Any, Throwable, Byte] =
-          ZStream.unwrapScoped[Any]:
-            ZIO.acquireRelease(
-              ZIO.succeed { inFlightStreams.incrementAndGet(); () }
-            )(_ => ZIO.succeed { inFlightStreams.decrementAndGet(); () })
-              .as(
-                handle
-                  .streamEntry(fileDetails.file)
-                  .mapError(_ => new java.nio.file.NoSuchFileException(fileDetails.file))
-              )
-        Response(
-          status  = Status.Ok,
-          headers = commonHeaders,
-          body    = Body.fromStreamChunked(entryStream),
-        )
+      // `unwrapScoped` + `acquireRelease` keeps the `inFlightStreams` gauge
+      // accurate across success, stream error, and client interrupt (H27):
+      // the scope spans the whole body stream's lifetime.
+      val entryStream: ZStream[Any, Throwable, Byte] =
+        ZStream.unwrapScoped[Any]:
+          ZIO.acquireRelease(
+            ZIO.succeed { inFlightStreams.incrementAndGet(); () }
+          )(_ => ZIO.succeed { inFlightStreams.decrementAndGet(); () })
+            .as(source.stream(fileDetails.file))
+      Response(
+        status  = Status.Ok,
+        headers = commonHeaders,
+        body    = Body.fromStreamChunked(entryStream),
+      )
 
   def fileHandler(gav: MavenCentral.GroupArtifactVersion, file: Path, request: Request): Handler[FilesEnv, Nothing, (MavenCentral.GroupArtifactVersion, Path, Request), Response] =
     Handler.fromZIO:
       if gav.groupId.toString.startsWith("org.webjars") then
-        ZIO.serviceWithZIO[JarCache](_.contains(gav)).flatMap: cached =>
-          ZIO.logInfo(s"webjar_cache=${if cached then "HIT" else "MISS"} gav=$gav") *>
-            ZIO.serviceWithZIO[LoadShedder](_.guard(gav, file, cached):
-              findFile(gav, file).flatMap(fileDetails => serveFile(gav, fileDetails, request)).catchAll:
-                e => ZIO.succeed(errorResponse(e))
-            )
+        ZIO.serviceWithZIO[WebJarStore](_.known(gav)).flatMap: maybeSource =>
+          val sourceLabel = maybeSource.fold("MISS"):
+            case _: WebJarSource.Stored => "STORED"
+            case _: WebJarSource.Local  => "LOCAL"
+          ZIO.logInfo(s"webjar_source=$sourceLabel gav=$gav") *>
+            maybeSource.fold(fetch(gav))(ZIO.succeed(_))
+              .flatMap(source => findFile(gav, source, file).map(serveFile(source, _, request)))
+              .catchAll(e => ZIO.succeed(errorResponse(e)))
       else
         val path = Path.root / "files" / "org.webjars" ++ request.url.path.drop(2)
         ZIO.succeed(Response.redirect(request.url.path(path), true))
 
-  def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
+  def listFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[FilesEnv, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     Handler.fromZIO:
       fetchFileList(gav)
     .flatMap:
@@ -440,7 +313,7 @@ object App extends ZIOAppDefault:
     .catchAll:
       e => errorResponse(e).toHandler
 
-  def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[Client & JarCache & MavenCentral.MavenCentralRepo, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
+  def numFilesHandler(gav: MavenCentral.GroupArtifactVersion, req: Request): Handler[FilesEnv, Nothing, (MavenCentral.GroupArtifactVersion, Request), Response] =
     // todo cache headers
     Handler.fromZIO:
       fetchFileList(gav)
@@ -505,7 +378,7 @@ object App extends ZIOAppDefault:
    * re-prepend `/files` on the way back in, which would mangle every
    * non-`/files` path.
    */
-  val otherRoutes: Routes[Client & JarCache & MavenCentral.MavenCentralRepo, Response] =
+  val otherRoutes: Routes[FilesEnv, Response] =
     Routes(
       Method.GET / "listfiles" / artifactVersionPathCodec -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Request)](addGroupId),
       Method.GET / "listfiles" / groupArtifactVersionPathCodec -> Handler.fromFunctionHandler[(MavenCentral.GroupArtifactVersion, Request)](listFilesHandler),
@@ -586,7 +459,8 @@ object App extends ZIOAppDefault:
       @@ corsMiddleware
       @@ requestLogging
 
-  override val run =
+  /** The server, with the object store as the only swappable piece (see `AppTest`). */
+  def serve(objectStore: ZLayer[Any, Throwable, ObjectStore]): ZIO[Any, Throwable, Nothing] =
     (snapshotLogger.forkDaemon *> Server.serve(app)).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
@@ -596,9 +470,7 @@ object App extends ZIOAppDefault:
       // with 403/429s, which trips the per-mirror circuit breaker and
       // sidelines it for `resetMin`. GCS tolerates the request volume
       // better, so leading with it keeps the fast path open; repo1 is
-      // still there to catch anything GCS is missing. Mirror choice does
-      // not affect the heap-OOM crash — that's the JarCache retention
-      // issue, tracked separately.
+      // still there to catch anything GCS is missing.
       MavenCentral.MavenCentralRepo.custom(
         mirrors = List(
           MavenCentral.gcsMirror,
@@ -606,6 +478,8 @@ object App extends ZIOAppDefault:
           MavenCentral.apacheAlias,
         )
       ),
-      jarCacheLayer,
-      loadShedderLayer,
+      objectStore,
+      WebJarStore.layer,
     )
+
+  override val run = serve(S3ObjectStore.fromEnv)

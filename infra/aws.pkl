@@ -1,0 +1,77 @@
+/// S3 storage for extracted webjar files, plus an IAM user that the service
+/// uses to read and write it.
+///
+/// The same template backs every stack (`webjars-file-service-prod`,
+/// `webjars-file-service-local`, ...). The access key is intentionally not a
+/// CloudFormation resource: its secret would be exposed in stack outputs.
+/// `deploy.sh` creates and rotates it out of band.
+///
+/// Regenerate after editing: `pkl eval aws.pkl -f yaml -o aws.yaml`
+amends "@cfn/template.pkl"
+
+import "@cfn/cloudformation.pkl"
+import "@cfn/aws/s3/bucket.pkl" as s3bucket
+import "@cfn/aws/iam/user.pkl" as iamuser
+
+Description = "webjars-file-service: S3 bucket for webjar files and an IAM user with read/write access"
+
+Resources {
+  ["Bucket"] = new s3bucket.Bucket {
+    // Stored files are the only copy of extracted webjars outside Maven
+    // Central; re-populating ~15M objects costs ~$80 in PUTs, so keep the
+    // bucket if the stack is deleted or the resource replaced.
+    DeletionPolicy = "Retain"
+    UpdateReplacePolicy = "Retain"
+    PublicAccessBlockConfiguration {
+      BlockPublicAcls = true
+      BlockPublicPolicy = true
+      IgnorePublicAcls = true
+      RestrictPublicBuckets = true
+    }
+    OwnershipControls {
+      Rules {
+        new { ObjectOwnership = "BucketOwnerEnforced" }
+      }
+    }
+  }
+
+  ["User"] = new iamuser.User {
+    Policies {
+      new {
+        PolicyName = "webjars-file-service-bucket"
+        PolicyDocument {
+          Version = "2012-10-17"
+          Statement {
+            new {
+              Effect = "Allow"
+              Action { "s3:GetObject"; "s3:PutObject" }
+              Resource = cloudformation.Sub("${Bucket.Arn}/*")
+            }
+            // Without ListBucket, HEAD/GET on a missing key is 403 instead of
+            // 404, which the service treats as an error rather than "not stored".
+            new {
+              Effect = "Allow"
+              Action { "s3:ListBucket" }
+              Resource = cloudformation.GetAtt("Bucket", "Arn")
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+Outputs {
+  ["BucketName"] {
+    Description = "S3_BUCKET for the service"
+    Value = cloudformation.Ref("Bucket")
+  }
+  ["UserName"] {
+    Description = "IAM user whose access key the service uses"
+    Value = cloudformation.Ref("User")
+  }
+  ["Region"] {
+    Description = "AWS_REGION for the service"
+    Value = cloudformation.Ref("AWS::Region")
+  }
+}

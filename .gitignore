@@ -17,3 +17,6 @@ dist
 
 # Agent Skills extracted by the build
 /.kiro/skills/
+
+# infra/deploy.sh local
+/.env.local

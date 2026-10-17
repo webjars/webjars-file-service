@@ -1,0 +1,7 @@
+amends "pkl:Project"
+
+dependencies {
+  ["cfn"] {
+    uri = "package://pkg.pkl-lang.org/github.com/aws-cloudformation/cloudformation-pkl/cloudformation@0.1.7"
+  }
+}

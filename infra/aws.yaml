@@ -1,0 +1,50 @@
+Description: 'webjars-file-service: S3 bucket for webjar files and an IAM user with read/write access'
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+        - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  User:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+      - PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            Resource:
+              Fn::Sub: ${Bucket.Arn}/*
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            Resource:
+              Fn::GetAtt:
+              - Bucket
+              - Arn
+        PolicyName: webjars-file-service-bucket
+Outputs:
+  BucketName:
+    Description: S3_BUCKET for the service
+    Value:
+      Ref: Bucket
+  UserName:
+    Description: IAM user whose access key the service uses
+    Value:
+      Ref: User
+  Region:
+    Description: AWS_REGION for the service
+    Value:
+      Ref: AWS::Region

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "resolvedDependencies": {
+    "package://pkg.pkl-lang.org/github.com/aws-cloudformation/cloudformation-pkl/cloudformation@0": {
+      "type": "remote",
+      "uri": "projectpackage://pkg.pkl-lang.org/github.com/aws-cloudformation/cloudformation-pkl/cloudformation@0.1.7",
+      "checksums": {
+        "sha256": "7f03e0786be6e6e8c7b4779309499e8c211500f3f32c3c7a46272fe686d83437"
+      }
+    }
+  }
+}

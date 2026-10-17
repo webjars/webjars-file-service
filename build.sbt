@@ -10,12 +10,21 @@ scalacOptions ++= Seq(
 
 libraryDependencies ++= Seq(
   "com.jamesward" %% "zio-mavencentral" % "0.14.1",
+  "dev.zio" %% "zio-s3" % "0.4.4",
 
   "org.slf4j" % "slf4j-simple" % "2.0.20",
 
-  "dev.zio" %% "zio-test"     % "2.1.26" % Test,
-  "dev.zio" %% "zio-test-sbt" % "2.1.26" % Test,
+  "dev.zio" %% "zio-test"     % "2.1.27" % Test,
+  "dev.zio" %% "zio-test-sbt" % "2.1.27" % Test,
+  // Local S3 emulator for tests and `Test/run` without AWS credentials.
+  // Excludes its slf4j 1.x binding, which conflicts with slf4j-simple 2.x.
+  ("io.floci" % "testcontainers-floci" % "2.16.1" % Test).exclude("org.slf4j", "slf4j-simple"),
 )
+
+// `Test/run` starts AppTest: real S3 when AWS credentials are set, otherwise
+// a Floci container.
+Test / mainClass := Some("AppTest")
+Test / run / fork := true
 
 // This is a deployed service, not a published library, so we don't need
 // Scaladoc. Disabling it stops the `doc` task from processing sources —
@@ -32,4 +41,4 @@ ThisBuild / mcpPort := 5115
 // SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.12" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.16" % Skills
