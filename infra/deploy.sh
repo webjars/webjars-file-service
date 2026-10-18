@@ -2,7 +2,7 @@
 # Create/update the S3 bucket + IAM user stack and hand its credentials to the
 # service.
 #
-#   infra/deploy.sh local            # writes .env.local (gitignored) for `./sbt Test/run`
+#   infra/deploy.sh local            # writes .env.local (gitignored) for `./sbta Test/run`
 #   infra/deploy.sh prod             # sets config vars on the Heroku app (restarts it)
 #   infra/deploy.sh <env> --rotate   # also replaces the access key
 #
