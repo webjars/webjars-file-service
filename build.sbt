@@ -45,7 +45,7 @@ Universal / javaOptions ++= Seq(
 Compile / doc / sources := Seq.empty
 Compile / packageDoc / publishArtifact := false
 
-// SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
+// SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
 libraryDependencies += "com.jamesward" % "skills" % "0.0.16" % Skills
