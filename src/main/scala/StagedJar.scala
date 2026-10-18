@@ -53,12 +53,17 @@ final class StagedJar private (
     withZip(_.getEntry(name) != null)
 
   def entryNames(predicate: String => Boolean): IO[Retired | IOException, List[String]] =
+    entries(predicate).map(_.map(_.name))
+
+  /** Matching entries with their uncompressed sizes (`-1` if the jar doesn't record it). */
+  def entries(predicate: String => Boolean): IO[Retired | IOException, List[Entry]] =
     withZip: z =>
       val it = z.entries.nn
-      val b  = List.newBuilder[String]
+      val b  = List.newBuilder[Entry]
       while it.hasMoreElements do
-        val name = it.nextElement().nn.getName.nn
-        if predicate(name) then b += name
+        val e = it.nextElement().nn
+        val name = e.getName.nn
+        if predicate(name) then b += Entry(name, e.getSize)
       b.result()
 
   def readEntry(name: String): IO[Retired | IOException, Array[Byte]] =
@@ -80,6 +85,8 @@ final class StagedJar private (
             ZStream.fail(NoSuchFileException(name))
 
 object StagedJar:
+
+  final case class Entry(name: String, size: Long)
 
   /** The jar was retired before this read started; read from the object store instead. */
   final case class Retired(gav: GroupArtifactVersion)

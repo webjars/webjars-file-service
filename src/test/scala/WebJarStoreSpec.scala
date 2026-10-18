@@ -28,11 +28,11 @@ object WebJarStoreSpec extends ZIOSpecDefault:
         before      <- store.known(gav)
         local       <- store.fetch(gav)
         localBytes  <- bytesOf(local, jqueryJs)
-        localNames  <- local.fileNames
+        localNames  <- local.fileNames.runCollect
         _           <- awaitStored(store)
         stored      <- store.known(gav).some
         storedBytes <- bytesOf(stored, jqueryJs)
-        storedNames <- stored.fileNames
+        storedNames <- stored.fileNames.runCollect
         // The staged jar is retired once stored; a source obtained before that
         // keeps working by reading from the object store.
         _           <- store.stagedCount.repeat(Schedule.recurUntil[Int](_ == 0) && Schedule.spaced(100.millis))
@@ -61,7 +61,7 @@ object WebJarStoreSpec extends ZIOSpecDefault:
       .provide(InMemoryObjectStore.layer, WebJarStore.layer, Client.default, MavenCentral.MavenCentralRepo.live, Scope.default),
     suite("Floci S3")(lifecycle)
       .provide(Floci.objectStore, WebJarStore.layer, Client.default, MavenCentral.MavenCentralRepo.live, Scope.default),
-    suite("upload slots")(busy, sharedFilePermits, absentCache)
+    suite("upload slots")(busy, sharedFilePermits, absentCache, legacyManifest)
       .provide(Client.default, MavenCentral.MavenCentralRepo.live, Scope.default),
   ) @@ TestAspect.withLiveClock @@ TestAspect.timeout(2.minutes)
 
@@ -90,6 +90,28 @@ object WebJarStoreSpec extends ZIOSpecDefault:
         _       <- store.storedCount.repeat(Schedule.recurUntil[Int](_ == 2) && Schedule.spaced(50.millis))
         max     <- objects.maxInFlight.get
       yield assertTrue(max <= 3, max >= 2)
+
+  private def legacyManifest =
+    test("an original-format manifest (embedded file list) is rewritten small, with a separate streamed file list"):
+      val names = List(jqueryJs, s"${WebJarStore.webJarsPathPrefix}/jquery/3.2.1/jquery.min.js")
+      val legacy = Manifest(None, Some("\"abc\""), files = Some(names))
+      for
+        memory   <- InMemoryObjectStore.make
+        json     <- zio.http.Body.json(legacy).asChunk
+        _        <- memory.write(WebJarStore.manifestKey(gav), json.toArray, None)
+        dir      <- WebJarStore.stagingDir
+        store    <- WebJarStore.make(memory, dir, maxConcurrentUploads = 1)
+        source   <- store.known(gav)
+        listed   <- ZIO.foreach(source)(_.fileNames.runCollect)
+        rewritten <- memory.read(WebJarStore.manifestKey(gav)).some.flatMap(b => zio.http.Body.fromChunk(b).asJson[Manifest])
+      yield assertTrue(
+        source.exists(isStored),
+        listed.contains(Chunk.fromIterable(names)),
+        rewritten.files.isEmpty,
+        rewritten.fileCount.contains(2),
+        rewritten.versionedLayout.contains(true),
+        rewritten.etag.contains("\"abc\""),
+      )
 
   private def absentCache =
     test("a GAV seen missing isn't re-read from the object store until this instance uploads it"):

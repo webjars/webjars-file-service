@@ -3,7 +3,7 @@ import com.jamesward.zio_mavencentral.MavenCentral.{GroupArtifactVersion, JarMet
 import zio.*
 import zio.http.{Body, Client, Header, MediaType}
 import zio.schema.{Schema, derived}
-import zio.stream.ZStream
+import zio.stream.{ZPipeline, ZStream}
 
 import java.io.{File, IOException}
 import java.time.ZonedDateTime
@@ -64,22 +64,42 @@ enum WebJarSource:
             case _: StagedJar.Retired => stored.open(entryName)
             case e: IOException       => ZIO.fail(e)
 
-  /** Sorted names of the user-visible webjar files. */
-  def fileNames: Task[Seq[String]] =
+  /**
+   * Sorted names of the user-visible webjar files. Stored webjars stream the
+   * list from the object store, so even a 150k-file webjar isn't
+   * materialized in memory.
+   */
+  def fileNames: ZStream[Any, Throwable, String] =
     this match
       case Stored(gav, _, _, store) =>
-        WebJarStore.readManifest(store, gav).someOrFail(IllegalStateException(s"manifest missing for stored $gav")).map(_.files)
+        ZStream.unwrapScoped:
+          store.get(WebJarStore.fileListKey(gav))
+            .someOrFail(IllegalStateException(s"file list missing for stored $gav"))
+            .map(_.body.via(ZPipeline.utf8Decode >>> ZPipeline.splitLines).filter(_.nonEmpty))
       case Local(jar, _) =>
-        jar.entryNames(WebJarStore.isWebJarFile).map(_.sorted).catchAll:
-          case _: StagedJar.Retired => stored.fileNames
-          case e: IOException       => ZIO.fail(e)
+        ZStream.unwrap:
+          jar.entryNames(WebJarStore.isWebJarFile).map(names => ZStream.fromIterable(names.sorted)).catchAll:
+            case _: StagedJar.Retired => ZIO.succeed(stored.fileNames)
+            case e: IOException       => ZIO.fail(e)
 
 /**
  * Per-GAV record written to the object store after every file of the
- * webjar has been uploaded. Its presence is what marks a GAV as stored, so
- * a partially-uploaded GAV (crash mid-upload) is simply re-populated.
+ * webjar (and its file list) has been uploaded. Its presence is what marks a
+ * GAV as stored, so a partially-uploaded GAV (crash mid-upload) is simply
+ * re-populated. Kept small: it's read once per GAV per process, often many
+ * at once right after a restart; the file list is a separate object.
+ *
+ * `files` is only present in the original format, which embedded the whole
+ * list (megabytes for big webjars). Those are rewritten into the small form
+ * the first time they're read (see `WebJarStore.fromManifest`).
  */
-final case class Manifest(lastModified: Option[ZonedDateTime], etag: Option[String], files: List[String]) derives Schema
+final case class Manifest(
+  lastModified: Option[ZonedDateTime],
+  etag: Option[String],
+  versionedLayout: Option[Boolean] = None,
+  fileCount: Option[Int] = None,
+  files: Option[List[String]] = None,
+) derives Schema
 
 /** Errors fetching a GAV that isn't stored yet. */
 final case class UploadsBusy(gav: GroupArtifactVersion)
@@ -99,11 +119,12 @@ type FetchError = NotFoundError | UpstreamCorrupt | UpstreamUnavailable
  * holds at most `maxConcurrentUploads` jars. Requests for a GAV already in a
  * slot share it.
  *
- * Serving from a staged jar is cheap; the scarce resource is object-store
- * write throughput. So slots are plentiful and every file upload, across all
- * slots, takes one of `maxConcurrentFileUploads` permits around both reading
- * the entry and writing it. That bounds the bytes held in memory and the
- * blocking threads reading jars, no matter how many GAVs are uploading.
+ * Serving from a staged jar is cheap; the scarce resources are object-store
+ * write throughput and heap. Every file upload, across all slots, takes one
+ * of `maxConcurrentFileUploads` permits (bounding PUTs and blocking jar
+ * reads) and, like every other whole-object read or write here, reserves its
+ * size from `memoryKb` (bounding bytes held in memory) for as long as it
+ * holds the bytes.
  *
  * A miss while every slot is in use fails with [[UploadsBusy]] rather than
  * queueing; stored GAVs are always served.
@@ -120,6 +141,8 @@ final case class WebJarStore(
   stagingDir: File,
   maxConcurrentUploads: Int,
   filePermits: Semaphore,
+  memoryKb: Semaphore,
+  legacyManifestPermits: Semaphore,
   stored: Ref[Map[GroupArtifactVersion, WebJarStore.StoredGav]],
   absent: Ref[Set[GroupArtifactVersion]],
   slots: Ref[Map[GroupArtifactVersion, Promise[FetchError, StagedJar]]],
@@ -213,8 +236,8 @@ final case class WebJarStore(
     ZIO.attemptBlockingIO(file.delete()).ignoreLogged
 
   private def fromManifest(gav: GroupArtifactVersion): UIO[Option[WebJarSource]] =
-    readManifest(objects, gav)
-      .map(_.map(m => StoredGav(m.meta, versionedLayout(gav, m.files))))
+    readManifest(gav)
+      .flatMap(ZIO.foreach(_)(upgradeIfLegacy(gav, _)))
       .tap:
         case Some(s) => stored.update(_.updated(gav, s))
         case None    => absent.update(a => (if a.size >= maxAbsent then Set.empty else a) + gav)
@@ -222,24 +245,57 @@ final case class WebJarStore(
       // An object-store outage degrades to the download path rather than failing requests.
       .catchAllCause(c => ZIO.logWarningCause(s"manifest read failed gav=$gav", c).as(None))
 
+  /** Reads a manifest, reserving its size from the memory budget while it's held. */
+  private def readManifest(gav: GroupArtifactVersion): Task[Option[Manifest]] =
+    ZIO.scoped:
+      objects.get(manifestKey(gav)).flatMap:
+        case None => ZIO.none
+        case Some(obj) =>
+          val kb     = budgetKb(obj.contentLength.getOrElse(0L))
+          val decode = memoryKb.withPermits(kb)(obj.body.runCollect.flatMap(b => Body.fromChunk(b).asJson[Manifest]))
+          // The original format can be megabytes; only a few of those at a time.
+          (if kb > smallManifestKb then legacyManifestPermits.withPermit(decode) else decode).asSome
+
+  /** Rewrites an original-format manifest into a small one plus a separate file list. */
+  private def upgradeIfLegacy(gav: GroupArtifactVersion, m: Manifest): Task[StoredGav] =
+    m.files match
+      case None =>
+        ZIO.succeed(StoredGav(m.meta, m.versionedLayout.getOrElse(true)))
+      case Some(files) =>
+        val small = Manifest(m.lastModified, m.etag, Some(versionedLayout(gav, files)), Some(files.size))
+        writeFileList(gav, files) *> writeManifest(gav, small) *>
+          ZIO.logInfo(s"webjar_manifest_upgraded gav=$gav files=${files.size}").as(StoredGav(small.meta, small.versionedLayout.getOrElse(true)))
+
+  private def writeFileList(gav: GroupArtifactVersion, files: Seq[String]): Task[Unit] =
+    val bytes = files.mkString("", "\n", "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    memoryKb.withPermits(budgetKb(bytes.length.toLong) * 2): // the joined String and its bytes
+      filePermits.withPermit(objects.write(fileListKey(gav), bytes, Some(MediaType.text.plain)))
+
+  private def writeManifest(gav: GroupArtifactVersion, m: Manifest): Task[Unit] =
+    Body.json(m).asChunk.flatMap: json =>
+      filePermits.withPermit(objects.write(manifestKey(gav), json.toArray, Some(MediaType.application.json)))
+
   private def upload(gav: GroupArtifactVersion, jar: StagedJar): Task[Unit] =
     def local[A](op: IO[StagedJar.Retired | IOException, A]): Task[A] =
       op.mapError:
         case r: StagedJar.Retired => IllegalStateException(s"staged jar retired during upload: ${r.gav}")
         case e: IOException       => e
     for
-      names    <- local(jar.entryNames(isWebJarFile)).map(_.sorted)
-      duration <- ZIO.foreachParDiscard(names): name =>
+      entries  <- local(jar.entries(isWebJarFile)).map(_.sortBy(_.name))
+      duration <- ZIO.foreachParDiscard(entries): entry =>
                     filePermits.withPermit:
-                      local(jar.readEntry(name))
-                        .flatMap(bytes => objects.write(fileKey(gav, name), bytes, contentType(name)))
+                      memoryKb.withPermits(budgetKb(entry.size)):
+                        local(jar.readEntry(entry.name))
+                          .flatMap(bytes => objects.write(fileKey(gav, entry.name), bytes, contentType(entry.name)))
                   .withParallelism(perGavParallelism)
                   .timed
                   .map(_._1)
-      manifest  = Manifest(jar.meta.maybeLastModified, jar.meta.maybeEtag.map(_.renderedValue), names)
-      json     <- Body.json(manifest).asChunk
-      _        <- filePermits.withPermit(objects.write(manifestKey(gav), json.toArray, Some(MediaType.application.json)))
-      _        <- stored.update(_.updated(gav, StoredGav(manifest.meta, versionedLayout(gav, names))))
+      names     = entries.map(_.name)
+      layout    = versionedLayout(gav, names)
+      _        <- writeFileList(gav, names)
+      manifest  = Manifest(jar.meta.maybeLastModified, jar.meta.maybeEtag.map(_.renderedValue), Some(layout), Some(names.size))
+      _        <- writeManifest(gav, manifest)
+      _        <- stored.update(_.updated(gav, StoredGav(manifest.meta, layout)))
       _        <- absent.update(_ - gav)
       _        <- ZIO.logInfo(s"webjar_uploaded gav=$gav files=${names.size} duration_ms=${duration.toMillis}")
     yield ()
@@ -267,6 +323,24 @@ object WebJarStore:
    */
   private val defaultMaxConcurrentUploads = 64
 
+  /**
+   * Heap reserved for whole objects held at once (file bytes being
+   * uploaded, manifests being decoded, file lists being written), in KB.
+   * Sized well under the 480 MB heap. An object bigger than the budget takes
+   * all of it, so it still proceeds, alone.
+   */
+  private val memoryBudgetKb = 96 * 1024
+
+  /** Manifests bigger than this are in the original (embedded file list) format. */
+  private val smallManifestKb = 16
+
+  /** Concurrent reads of original-format manifests, which can be megabytes. */
+  private val maxConcurrentLegacyManifestReads = 2
+
+  /** Permits to reserve for an object of `bytes`; at least 1, at most the whole budget. */
+  private def budgetKb(bytes: Long): Int =
+    math.min(memoryBudgetKb.toLong, math.max(1L, (bytes + 1023) / 1024)).toInt
+
   /** Bound for `absent`; real webjar versions number ~83k, junk paths are unbounded. */
   private val maxAbsent = 200_000
 
@@ -280,6 +354,10 @@ object WebJarStore:
 
   def manifestKey(gav: GroupArtifactVersion): StoreKey =
     StoreKey(s"manifests/$gav.json")
+
+  /** Newline-separated sorted jar entry names of the webjar's files. */
+  def fileListKey(gav: GroupArtifactVersion): StoreKey =
+    StoreKey(s"filelists/$gav.txt")
 
   private def contentType(name: String): Option[MediaType] =
     name.split('.').lastOption.flatMap(MediaType.forFileExtension)
@@ -296,10 +374,6 @@ object WebJarStore:
   extension (m: Manifest)
     def meta: JarMeta = JarMeta(m.lastModified, m.etag.flatMap(Header.ETag.parse(_).toOption))
 
-  def readManifest(store: ObjectStore, gav: GroupArtifactVersion): Task[Option[Manifest]] =
-    store.read(manifestKey(gav)).flatMap: maybeBytes =>
-      ZIO.foreach(maybeBytes)(bytes => Body.fromChunk(bytes).asJson[Manifest])
-
   /** A fresh staging directory, deleted (with anything left in it) when the scope closes. */
   val stagingDir: ZIO[Scope, Nothing, File] =
     ZIO.acquireRelease(
@@ -314,12 +388,14 @@ object WebJarStore:
   def make(objects: ObjectStore, stagingDir: File, maxConcurrentUploads: Int, maxConcurrentFileUploads: Int = maxConcurrentFileUploads): UIO[WebJarStore] =
     for
       permits <- Semaphore.make(maxConcurrentFileUploads.toLong)
+      memory  <- Semaphore.make(memoryBudgetKb.toLong)
+      legacy  <- Semaphore.make(maxConcurrentLegacyManifestReads.toLong)
       stored  <- Ref.make(Map.empty[GroupArtifactVersion, StoredGav])
       absent  <- Ref.make(Set.empty[GroupArtifactVersion])
       slots   <- Ref.make(Map.empty[GroupArtifactVersion, Promise[FetchError, StagedJar]])
       staged  <- Ref.make(Map.empty[File, Long])
       busy    <- Ref.make(0L)
-    yield WebJarStore(objects, stagingDir, maxConcurrentUploads, permits, stored, absent, slots, staged, busy)
+    yield WebJarStore(objects, stagingDir, maxConcurrentUploads, permits, memory, legacy, stored, absent, slots, staged, busy)
 
   val layer: ZLayer[ObjectStore, Nothing, WebJarStore] =
     ZLayer.scoped:

@@ -210,13 +210,12 @@ object App extends ZIOAppDefault:
         Response.notFound(t.getMessage)
 
   def fetchFileList(gav: MavenCentral.GroupArtifactVersion): ZIO[FilesEnv, Throwable, JarDetails] =
-    webJarSource(gav).flatMap: source =>
-      source.fileNames.map: names =>
-        JarDetails(
-          source.meta.maybeEtag,
-          source.meta.maybeLastModified.map(Header.LastModified(_)),
-          ZStream.fromIterable(names),
-        )
+    webJarSource(gav).map: source =>
+      JarDetails(
+        source.meta.maybeEtag,
+        source.meta.maybeLastModified.map(Header.LastModified(_)),
+        source.fileNames,
+      )
 
   /** Stream the bytes of a single jar entry; fails with `NoSuchFileException` if it's missing. */
   def readFileFromJar(gav: MavenCentral.GroupArtifactVersion, entryPath: String): ZStream[FilesEnv, Throwable, Byte] =
