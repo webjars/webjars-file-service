@@ -17,7 +17,7 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test-sbt" % "2.1.27" % Test,
   // Local S3 emulator for tests and `Test/run` without AWS credentials.
   // Excludes its slf4j 1.x binding, which conflicts with slf4j-simple 2.x.
-  ("io.floci" % "testcontainers-floci" % "2.16.1" % Test).exclude("org.slf4j", "slf4j-simple"),
+  ("io.floci" % "testcontainers-floci" % "2.17.0" % Test).exclude("org.slf4j", "slf4j-simple"),
 )
 
 // `Test/run` starts AppTest: real S3 when AWS credentials are set, otherwise
@@ -48,4 +48,4 @@ Compile / packageDoc / publishArtifact := false
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.16" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.17" % Skills
