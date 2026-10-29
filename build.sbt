@@ -9,7 +9,7 @@ scalacOptions ++= Seq(
 )
 
 libraryDependencies ++= Seq(
-  "com.jamesward" %% "zio-mavencentral" % "0.14.1",
+  "com.jamesward" %% "zio-mavencentral" % "0.15.0",
 
   "org.slf4j" % "slf4j-simple" % "2.0.20",
 
@@ -48,4 +48,4 @@ Compile / packageDoc / publishArtifact := false
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.17" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.19" % Skills
