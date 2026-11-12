@@ -122,7 +122,7 @@ object App extends ZIOAppDefault:
    */
   val snapshotLogger: ZIO[WebJarStore, Nothing, Long] =
     ZIO.serviceWithZIO[WebJarStore]: store =>
-      store.stagedCount.zip(store.stagedBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).zip(store.absentCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy, absentGavs) =>
+      store.stagedCount.zip(store.stagedBytes).zip(store.storedCount).zip(store.uploadingCount).zip(store.busyCount).zip(store.absentCount).zip(store.uploadsLastHour).zip(store.rateLimitedCount).flatMap: (staged, stagedBytes, storedGavs, uploadingGavs, busy, absentGavs, uploadsLastHour, rateLimited) =>
         ZIO.succeed:
           val heap          = memoryBean.getHeapMemoryUsage.nn
           val (oldUsed, oldMax) = oldGenPool match
@@ -151,6 +151,8 @@ object App extends ZIOAppDefault:
               s"uploading_gavs=$uploadingGavs " +
               s"absent_gavs=$absentGavs " +
               s"uploads_busy_total=$busy " +
+              s"uploads_last_hour=$uploadsLastHour " +
+              s"uploads_rate_limited_total=$rateLimited " +
               s"in_flight_streams=$inFlight"
           )
     .repeat(Schedule.fixed(30.seconds))
@@ -173,6 +175,8 @@ object App extends ZIOAppDefault:
         WebJarCorruptException(s"WebJar bytes are corrupt: ${e.gav} (size=${e.sizeBytes}B): ${e.reason}")
       case _: UploadsBusy =>
         TemporarilyUnavailableException(s"WebJar $gav is not stored yet and all upload slots are busy")
+      case _: UploadsRateLimited =>
+        TemporarilyUnavailableException(s"WebJar $gav is not stored yet and the hourly upload limit is reached")
       case e: UpstreamUnavailable =>
         TemporarilyUnavailableException(s"WebJar $gav could not be fetched from Maven Central: ${e.reason}")
 
@@ -443,9 +447,29 @@ object App extends ZIOAppDefault:
    * was invisible to tests that called `routes.runZIO` directly.
    */
   val app: Routes[FilesEnv, Response] =
-    (cachedFilesRoutes ++ otherRoutes)
-      @@ corsMiddleware
-      @@ requestLogging
+    withClientAnnotations(
+      (cachedFilesRoutes ++ otherRoutes)
+        @@ corsMiddleware
+        @@ requestLogging
+    )
+
+  /**
+   * Annotates every log line of a request, including the forked upload's
+   * `webjar_upload_started` / `webjar_downloaded` / `webjar_uploaded` lines,
+   * with the client IP (the last `X-Forwarded-For` hop, which Heroku's router
+   * adds) and User-Agent, so the source of uploads can be traced.
+   */
+  private def withClientAnnotations[Env](routes: Routes[Env, Response]): Routes[Env, Response] =
+    routes.transform: handler =>
+      Handler.scoped[Env]:
+        Handler.fromFunctionZIO[Request]: request =>
+          val ip = request.headers.get("X-Forwarded-For").flatMap(_.split(',').lastOption).map(_.trim).filter(_.nonEmpty)
+            .orElse(request.remoteAddress.map(_.getHostAddress.nn))
+          val ua = request.headers.get(Header.UserAgent.name)
+          val annotations = ip.map(LogAnnotation("client_ip", _)).toList ++ ua.map(LogAnnotation("client_user_agent", _)).toList
+          annotations match
+            case head :: tail => ZIO.logAnnotate(head, tail*)(handler(request))
+            case Nil          => handler(request)
 
   /** The server, with the object store as the only swappable piece (see `AppTest`). */
   def serve(objectStore: ZLayer[Any, Throwable, ObjectStore]): ZIO[Any, Throwable, Nothing] =

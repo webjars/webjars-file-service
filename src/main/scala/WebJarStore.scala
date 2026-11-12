@@ -6,7 +6,7 @@ import zio.schema.{Schema, derived}
 import zio.stream.{ZPipeline, ZStream}
 
 import java.io.{File, IOException}
-import java.time.ZonedDateTime
+import java.time.{Instant, ZonedDateTime}
 import java.util.UUID
 import java.util.zip.ZipException
 
@@ -103,6 +103,8 @@ final case class Manifest(
 
 /** Errors fetching a GAV that isn't stored yet. */
 final case class UploadsBusy(gav: GroupArtifactVersion)
+/** More than `maxUploadsPerHour` new GAVs were started in the last hour. */
+final case class UploadsRateLimited(gav: GroupArtifactVersion)
 final case class UpstreamCorrupt(gav: GroupArtifactVersion, sizeBytes: Long, reason: String)
 final case class UpstreamUnavailable(gav: GroupArtifactVersion, reason: String)
 
@@ -127,7 +129,10 @@ type FetchError = NotFoundError | UpstreamCorrupt | UpstreamUnavailable
  * holds the bytes.
  *
  * A miss while every slot is in use fails with [[UploadsBusy]] rather than
- * queueing; stored GAVs are always served.
+ * queueing; stored GAVs are always served. Each upload costs one object-store
+ * PUT per file, so at most `maxUploadsPerHour` new GAVs start per rolling
+ * hour; past that a miss fails with [[UploadsRateLimited]]. A flood walking
+ * versions that aren't stored yet otherwise turns directly into S3 cost.
  *
  * `stored` remembers which GAVs are in the object store (with their cache
  * metadata) so each GAV costs at most one manifest read per process. It is
@@ -148,6 +153,9 @@ final case class WebJarStore(
   slots: Ref[Map[GroupArtifactVersion, Promise[FetchError, StagedJar]]],
   staged: Ref[Map[File, Long]],
   busyRejections: Ref[Long],
+  maxUploadsPerHour: Int,
+  uploadStarts: Ref[Chunk[Instant]],
+  rateLimitedRejections: Ref[Long],
 ):
   import WebJarStore.*
 
@@ -166,24 +174,46 @@ final case class WebJarStore(
    * Take an upload slot for `gav` (or join the one already holding it) and
    * wait for its jar to be staged.
    */
-  def fetch(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, FetchError | UploadsBusy, WebJarSource] =
+  def fetch(gav: GroupArtifactVersion): ZIO[Client & MavenCentralRepo, FetchError | UploadsBusy | UploadsRateLimited, WebJarSource] =
     stored.get.map(_.get(gav)).flatMap:
       case Some(s) => ZIO.succeed(s.source(gav, objects))
       case None =>
         Promise.make[FetchError, StagedJar].flatMap: mine =>
-          slots.modify: m =>
-            m.get(gav) match
-              case Some(existing)                     => (Some(existing), m)
-              case None if m.size >= maxConcurrentUploads => (None, m)
-              case None                               => (Some(mine), m.updated(gav, mine))
+          slots.get.map(_.contains(gav)).flatMap: joining =>
+            // Joining an upload already in progress is free; only new uploads count.
+            if joining then ZIO.succeed(true) else tryStartUpload
+          .flatMap:
+            case false =>
+              rateLimitedRejections.update(_ + 1) *>
+                ZIO.logWarning(s"webjar_upload_rate_limited gav=$gav max_uploads_per_hour=$maxUploadsPerHour") *>
+                ZIO.fail(UploadsRateLimited(gav))
+            case true =>
+              slots.modify: m =>
+                m.get(gav) match
+                  case Some(existing)                     => (Some(existing), m)
+                  case None if m.size >= maxConcurrentUploads => (None, m)
+                  case None                               => (Some(mine), m.updated(gav, mine))
           .flatMap:
             case None =>
               busyRejections.update(_ + 1) *> ZIO.fail(UploadsBusy(gav))
             case Some(staging) =>
               // The slot owner runs as a daemon so a requester being interrupted
               // can't leave the promise incomplete or the slot held.
-              populate(gav, mine).forkDaemon.when(staging eq mine) *>
+              (ZIO.logInfo(s"webjar_upload_started gav=$gav") *> populate(gav, mine).forkDaemon).when(staging eq mine) *>
                 staging.await.map(WebJarSource.Local(_, objects))
+
+  /** Records an upload start if fewer than `maxUploadsPerHour` started in the last hour. */
+  private val tryStartUpload: UIO[Boolean] =
+    Clock.instant.flatMap: now =>
+      val cutoff = now.minusSeconds(3600)
+      uploadStarts.modify: starts =>
+        val recent = starts.filter(_.isAfter(cutoff))
+        if recent.size < maxUploadsPerHour then (true, recent :+ now) else (false, recent)
+
+  def uploadsLastHour: UIO[Int] =
+    Clock.instant.flatMap(now => uploadStarts.get.map(_.count(_.isAfter(now.minusSeconds(3600)))))
+
+  def rateLimitedCount: UIO[Long] = rateLimitedRejections.get
 
   def storedCount: UIO[Int]   = stored.get.map(_.size)
   def uploadingCount: UIO[Int] = slots.get.map(_.size)
@@ -385,7 +415,16 @@ object WebJarStore:
       .ignoreLogged
     )
 
-  def make(objects: ObjectStore, stagingDir: File, maxConcurrentUploads: Int, maxConcurrentFileUploads: Int = maxConcurrentFileUploads): UIO[WebJarStore] =
+  /** Default for `MAX_UPLOADS_PER_HOUR`. Normal days upload tens to a few hundred GAVs. */
+  val defaultMaxUploadsPerHour = 600
+
+  def make(
+    objects: ObjectStore,
+    stagingDir: File,
+    maxConcurrentUploads: Int,
+    maxConcurrentFileUploads: Int = maxConcurrentFileUploads,
+    maxUploadsPerHour: Int = defaultMaxUploadsPerHour,
+  ): UIO[WebJarStore] =
     for
       permits <- Semaphore.make(maxConcurrentFileUploads.toLong)
       memory  <- Semaphore.make(memoryBudgetKb.toLong)
@@ -395,12 +434,17 @@ object WebJarStore:
       slots   <- Ref.make(Map.empty[GroupArtifactVersion, Promise[FetchError, StagedJar]])
       staged  <- Ref.make(Map.empty[File, Long])
       busy    <- Ref.make(0L)
-    yield WebJarStore(objects, stagingDir, maxConcurrentUploads, permits, memory, legacy, stored, absent, slots, staged, busy)
+      starts  <- Ref.make(Chunk.empty[Instant])
+      limited <- Ref.make(0L)
+    yield WebJarStore(objects, stagingDir, maxConcurrentUploads, permits, memory, legacy, stored, absent, slots, staged, busy, maxUploadsPerHour, starts, limited)
 
-  val layer: ZLayer[ObjectStore, Nothing, WebJarStore] =
+  /** Reads `MAX_UPLOADS_PER_HOUR` from the environment (Heroku config var). */
+  val layer: ZLayer[ObjectStore, Config.Error, WebJarStore] =
     ZLayer.scoped:
       for
-        objects <- ZIO.service[ObjectStore]
-        dir     <- stagingDir
-        store   <- make(objects, dir, defaultMaxConcurrentUploads)
+        objects   <- ZIO.service[ObjectStore]
+        perHour   <- ZIO.config(Config.int("MAX_UPLOADS_PER_HOUR").withDefault(defaultMaxUploadsPerHour))
+        _         <- ZIO.logInfo(s"webjar_store max_uploads_per_hour=$perHour")
+        dir       <- stagingDir
+        store     <- make(objects, dir, defaultMaxConcurrentUploads, maxUploadsPerHour = perHour)
       yield store
