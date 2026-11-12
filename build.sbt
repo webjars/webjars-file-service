@@ -2,14 +2,14 @@ enablePlugins(JavaAppPackaging)
 
 name := "webjars-file-service"
 
-scalaVersion := "3.10.0"
+scalaVersion := "3.10.1"
 
 scalacOptions ++= Seq(
   "-language:strictEquality",
 )
 
 libraryDependencies ++= Seq(
-  "com.jamesward" %% "zio-mavencentral" % "0.15.0",
+  "com.jamesward" %% "zio-mavencentral" % "0.16.0",
 
   "org.slf4j" % "slf4j-simple" % "2.0.20",
 
@@ -48,4 +48,4 @@ Compile / packageDoc / publishArtifact := false
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.22" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.26" % Skills
