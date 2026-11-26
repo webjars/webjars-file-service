@@ -476,20 +476,11 @@ object App extends ZIOAppDefault:
     (snapshotLogger.forkDaemon *> Server.serve(app)).provide(
       serverLayer,
       Client.default.update(_ @@ ZClientAspect.requestLogging()),
-      // Google's GCS mirror is the default backend, with Maven Central
-      // (repo1 + the Apache alias) as fallback. Rationale: under our
-      // crawler-driven long-tail load, repo1.maven.org throttles the app
-      // with 403/429s, which trips the per-mirror circuit breaker and
-      // sidelines it for `resetMin`. GCS tolerates the request volume
-      // better, so leading with it keeps the fast path open; repo1 is
-      // still there to catch anything GCS is missing.
-      MavenCentral.MavenCentralRepo.custom(
-        mirrors = List(
-          MavenCentral.gcsMirror,
-          MavenCentral.primaryUri,
-          MavenCentral.apacheAlias,
-        )
-      ),
+      // repo1 is authoritative; Google's GCS copy serves immutable files (jars,
+      // POMs) first so the bulk of the bytes stays off repo1, which throttles
+      // our crawler-driven long-tail load with 403/429s. That is the library's
+      // default mirror set and ordering.
+      MavenCentral.MavenCentralRepo.live,
       objectStore,
       WebJarStore.layer,
     )
